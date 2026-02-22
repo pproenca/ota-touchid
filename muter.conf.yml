@@ -1,0 +1,10 @@
+arguments:
+- test
+executable: /usr/bin/swift
+exclude:
+- Package.swift
+- Sources/Server/main.swift
+- Sources/Client/main.swift
+- Sources/Shared/TLS.swift
+excludeCalls: []
+coverageThreshold: 0e+0
