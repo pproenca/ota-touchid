@@ -23,6 +23,7 @@ struct FrameTests {
         #expect(decoded.version == OTA.protocolVersion)
         #expect(decoded.hasStoredKey == false)
         #expect(decoded.clientProof == nil)
+        #expect(decoded.mode == nil)
     }
 
     @Test("Round-trip AuthRequest with all fields")
@@ -39,6 +40,7 @@ struct FrameTests {
         #expect(decoded.clientProof != nil)
         #expect(Data(base64Encoded: decoded.clientProof!) == proof)
         #expect(decoded.version == OTA.protocolVersion)
+        #expect(decoded.mode == nil)
     }
 
     @Test("Round-trip encode/decode preserves AuthResponse")
@@ -111,6 +113,33 @@ struct FrameTests {
         #expect(decoded.approved == true)
         #expect(decoded.publicKey == nil)
         #expect(decoded.signature != nil)
+    }
+
+    @Test("Round-trip AuthRequest with test mode")
+    func roundTripTestMode() throws {
+        let nonce = Data(repeating: 0xCC, count: OTA.nonceSize)
+        let proof = Data(repeating: 0x02, count: 32)
+        let original = AuthRequest(
+            nonce: nonce, reason: "test", hasStoredKey: true, clientProof: proof, mode: "test")
+        let encoded = try Frame.encode(original)
+        let payload = encoded.suffix(from: 4)
+        let decoded = try Frame.decode(AuthRequest.self, from: Data(payload))
+
+        #expect(decoded.mode == "test")
+        #expect(decoded.reason == "test")
+        #expect(decoded.hasStoredKey == true)
+        #expect(decoded.clientProof != nil)
+    }
+
+    @Test("Backward compat: decode JSON without mode key yields nil")
+    func backwardCompatMissingMode() throws {
+        // Simulate a v1 client that doesn't send mode
+        let json = """
+        {"version":1,"nonce":"AAAA","reason":"sudo","hostname":"test","hasStoredKey":false}
+        """
+        let decoded = try JSONDecoder().decode(AuthRequest.self, from: json.data(using: .utf8)!)
+        #expect(decoded.mode == nil)
+        #expect(decoded.reason == "sudo")
     }
 }
 

@@ -24,8 +24,7 @@ public enum ServerCommand {
             print("OTA Touch ID Server")
             print(String(repeating: "\u{2500}", count: 40))
             print("Public key: \(pubRaw.base64EncodedString())")
-            print("PSK:        \(pskBase64)")
-            print("  Pair a client: ota-touchid pair \(pskBase64)\n")
+            print("PSK:        \(pskBase64)\n")
 
             let server = try Server(
                 keyBlob: key.dataRepresentation,
@@ -43,11 +42,22 @@ public enum ServerCommand {
         }
     }
 
-    /// Generate keys + PSK without starting the listener. Returns PSK base64.
-    public static func generateConfig() throws -> String {
-        _ = try loadOrCreateKey()
+    /// Generate keys + PSK without starting the listener. Returns PSK and public key as base64.
+    public static func generateConfig() throws -> (pskBase64: String, publicKeyBase64: String) {
+        let key = try loadOrCreateKey()
         let psk = try loadOrCreatePSK()
-        return psk.withUnsafeBytes { Data($0) }.base64EncodedString()
+        let pskBase64 = psk.withUnsafeBytes { Data($0) }.base64EncodedString()
+        let publicKeyBase64 = key.publicKey.rawRepresentation.base64EncodedString()
+        return (pskBase64, publicKeyBase64)
+    }
+
+    /// Save PSK and public key to iCloud Keychain for auto-pairing.
+    public static func publishToKeychain(pskBase64: String, publicKeyBase64: String) throws {
+        guard let pskData = pskBase64.data(using: .utf8),
+              let pubKeyData = publicKeyBase64.data(using: .utf8)
+        else { return }
+        try SyncedKeychain.save(account: .preSharedKey, data: pskData)
+        try SyncedKeychain.save(account: .serverPublicKey, data: pubKeyData)
     }
 }
 
@@ -304,6 +314,14 @@ private final class Server: @unchecked Sendable {
             reply(
                 .init(approved: false, error: OTAError.authenticationFailed.clientDescription),
                 on: conn)
+            return
+        }
+
+        // Test mode: PSK verified, skip Touch ID
+        if req.mode == "test" {
+            print("\n[\(source)] test request (client hostname: \(req.hostname)) — OK")
+            auditLog("TEST_OK source=\(source) hostname=\(req.hostname)")
+            reply(.init(approved: true), on: conn)
             return
         }
 

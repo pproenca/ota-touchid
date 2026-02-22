@@ -10,19 +10,34 @@ let command = args.first ?? "help"
 
 switch command {
 case "setup":
-    SetupCommand.run()
+    SetupCommand.run(args: Array(args.dropFirst()))
 
-case "pair":
-    guard args.count >= 2 else {
-        fputs("Usage: ota-touchid pair <psk-base64>\n", stderr)
+case "test":
+    var host: String?
+    var port: UInt16?
+    var i = 1
+    while i < args.count {
+        switch args[i] {
+        case "--host" where i + 1 < args.count:
+            i += 1; host = args[i]
+        case "--port" where i + 1 < args.count:
+            i += 1
+            guard let p = UInt16(args[i]) else {
+                fputs("Error: Invalid port '\(args[i])'\n", stderr)
+                exit(1)
+            }
+            port = p
+        default:
+            fputs("Unknown option: \(args[i])\n", stderr)
+            exit(1)
+        }
+        i += 1
+    }
+    if (host == nil) != (port == nil) {
+        fputs("Error: --host and --port must be used together\n", stderr)
         exit(1)
     }
-    do {
-        try ClientCommand.pair(pskBase64: args[1])
-    } catch {
-        fputs("Error: \(error.localizedDescription)\n", stderr)
-        exit(1)
-    }
+    ClientCommand.test(host: host, port: port)
 
 case "auth":
     var reason = "authentication"
@@ -54,14 +69,15 @@ case "auth":
     }
     ClientCommand.auth(reason: reason, host: host, port: port)
 
-case "serve":
-    ServerCommand.run()
-
 case "status":
     StatusCommand.run()
 
 case "uninstall":
     UninstallCommand.run()
+
+case "serve":
+    // Hidden command — used by launchd
+    ServerCommand.run()
 
 case "help", "--help", "-h":
     printUsage()
@@ -76,9 +92,67 @@ default:
 // MARK: - Setup Command
 
 enum SetupCommand {
-    static func run() {
+    static func run(args: [String]) {
+        // Parse flags
+        var role: String?
+        var pskOverride: String?
+        var i = 0
+        while i < args.count {
+            switch args[i] {
+            case "--server":
+                role = "server"
+            case "--client":
+                role = "client"
+            case "--psk" where i + 1 < args.count:
+                i += 1; pskOverride = args[i]
+            default:
+                fputs("Unknown option: \(args[i])\n", stderr)
+                exit(1)
+            }
+            i += 1
+        }
+
+        // Interactive prompt if no role flag
+        if role == nil {
+            fputs("Set up this Mac as:\n  1) Server (has Touch ID)\n  2) Client (remote machine)\nChoice [1/2]: ", stderr)
+            guard let line = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) else {
+                fputs("No input. Aborting.\n", stderr)
+                exit(1)
+            }
+            switch line {
+            case "1", "server": role = "server"
+            case "2", "client": role = "client"
+            default:
+                fputs("Invalid choice. Aborting.\n", stderr)
+                exit(1)
+            }
+        }
+
+        switch role {
+        case "server":
+            setupServer()
+        case "client":
+            setupClient(pskBase64: pskOverride)
+        default:
+            fatalError("unreachable")
+        }
+    }
+
+    private static func setupServer() {
         do {
-            let pskBase64 = try ServerCommand.generateConfig()
+            let config = try ServerCommand.generateConfig()
+
+            // Attempt iCloud Keychain publish (best-effort)
+            do {
+                try ServerCommand.publishToKeychain(
+                    pskBase64: config.pskBase64,
+                    publicKeyBase64: config.publicKeyBase64
+                )
+                fputs("PSK and public key saved to iCloud Keychain.\n", stderr)
+            } catch {
+                fputs("Warning: Could not save to iCloud Keychain (\(error.localizedDescription)).\n", stderr)
+                fputs("Clients on other Macs will need the PSK manually.\n", stderr)
+            }
 
             // Resolve binary path for launchd plist
             let binaryPath: String
@@ -97,10 +171,12 @@ enum SetupCommand {
             let plistContent = launchdPlist(binaryPath: binaryPath)
             try plistContent.write(to: plistPath, atomically: true, encoding: .utf8)
 
-            // Load the agent
+            // Load the agent (unload first in case it's already loaded)
             let unload = Process()
             unload.executableURL = URL(fileURLWithPath: "/bin/launchctl")
             unload.arguments = ["unload", plistPath.path]
+            unload.standardOutput = FileHandle.nullDevice
+            unload.standardError = FileHandle.nullDevice
             try? unload.run()
             unload.waitUntilExit()
 
@@ -117,14 +193,35 @@ enum SetupCommand {
             }
 
             print("")
-            print("OTA Touch ID Setup Complete")
+            print("OTA Touch ID Server Setup Complete")
             print(String(repeating: "\u{2500}", count: 40))
             print("Server installed as launchd agent (starts on login).")
             print("")
-            print("To pair a client, run on the client machine:")
-            print("  ota-touchid pair \(pskBase64)")
+            print("To set up a client Mac (same Apple ID — auto-pairing):")
+            print("  ota-touchid setup --client")
             print("")
-            print("Then authenticate with:")
+            print("To set up a client Mac (different Apple ID — manual PSK):")
+            print("  ota-touchid setup --client --psk \(config.pskBase64)")
+            print("")
+            print("Then verify with:")
+            print("  ota-touchid test")
+        } catch {
+            fputs("Error: \(error.localizedDescription)\n", stderr)
+            exit(1)
+        }
+    }
+
+    private static func setupClient(pskBase64: String?) {
+        do {
+            try ClientCommand.setupClient(pskBase64: pskBase64)
+
+            print("")
+            print("OTA Touch ID Client Setup Complete")
+            print(String(repeating: "\u{2500}", count: 40))
+            print("Verify connectivity:")
+            print("  ota-touchid test")
+            print("")
+            print("Authenticate:")
             print("  ota-touchid auth --reason sudo")
         } catch {
             fputs("Error: \(error.localizedDescription)\n", stderr)
@@ -205,6 +302,10 @@ enum StatusCommand {
         // Client-side status
         ClientCommand.status()
 
+        // iCloud Keychain PSK
+        let keychainPSK = SyncedKeychain.read(account: .preSharedKey) != nil
+        print("iCloud PSK:  \(keychainPSK ? "present" : "not found")")
+
         // LaunchD service
         print("")
         let list = Process()
@@ -219,7 +320,7 @@ enum StatusCommand {
         if list.terminationStatus == 0 {
             print("LaunchD:     running")
         } else {
-            print("LaunchD:     not loaded (run 'ota-touchid setup' to install)")
+            print("LaunchD:     not loaded (run 'ota-touchid setup --server' to install)")
         }
     }
 }
@@ -236,6 +337,8 @@ enum UninstallCommand {
             let unload = Process()
             unload.executableURL = URL(fileURLWithPath: "/bin/launchctl")
             unload.arguments = ["unload", plistPath.path]
+            unload.standardOutput = FileHandle.nullDevice
+            unload.standardError = FileHandle.nullDevice
             try? unload.run()
             unload.waitUntilExit()
 
@@ -243,6 +346,16 @@ enum UninstallCommand {
             print("LaunchD agent unloaded and plist removed.")
         } else {
             print("No launchd plist found.")
+        }
+
+        // Ask about Keychain items
+        fputs("Remove iCloud Keychain items? [y/N] ", stderr)
+        if let line = readLine()?.lowercased(), line == "y" || line == "yes" {
+            SyncedKeychain.delete(account: .preSharedKey)
+            SyncedKeychain.delete(account: .serverPublicKey)
+            print("Keychain items removed.")
+        } else {
+            print("Keychain items kept.")
         }
 
         // Ask about config
@@ -264,28 +377,33 @@ enum UninstallCommand {
 
 func printUsage() {
     print("""
-        OTA Touch ID — Over-the-air Touch ID authentication
+        OTA Touch ID \u{2014} Over-the-air Touch ID authentication
 
         Usage:
-          ota-touchid setup                        Generate keys, install server as launchd agent
-          ota-touchid pair <psk>                   Save PSK on client machine
-          ota-touchid auth [options]               Authenticate via Touch ID (exit 0=ok, 1=denied)
-          ota-touchid serve                        Run server in foreground
-          ota-touchid status                       Show config & service status
-          ota-touchid uninstall                    Stop service, remove launchd agent
-          ota-touchid help                         Show this help
+          ota-touchid setup [--server | --client] [--psk <base64>]
+              Interactive install. Sets up server (Touch ID Mac) or client (remote Mac).
+              Same-Apple-ID devices auto-pair via iCloud Keychain.
 
-        Auth options:
-          --reason <text>                          Reason shown in Touch ID prompt (default: "authentication")
-          --host <ip> --port <port>                Direct connection (skip Bonjour discovery)
+          ota-touchid test [--host <ip> --port <port>]
+              Verify connectivity to server (no Touch ID prompt).
 
-        Quick start (server):
+          ota-touchid auth [--reason <text>] [--host <ip> --port <port>]
+              Authenticate via Touch ID. Exit 0 = approved, 1 = denied.
+
+          ota-touchid status
+              Show configuration and service status.
+
+          ota-touchid uninstall
+              Stop service, remove launchd agent, optionally clean up.
+
+        Quick start (server Mac):
           brew install pproenca/tap/ota-touchid
-          ota-touchid setup
+          ota-touchid setup --server
 
-        Quick start (client):
+        Quick start (client Mac, same Apple ID):
           brew install pproenca/tap/ota-touchid
-          ota-touchid pair <psk>                   (use PSK from server setup output)
+          ota-touchid setup --client
+          ota-touchid test
           ota-touchid auth --reason sudo
         """)
 }

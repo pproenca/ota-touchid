@@ -27,7 +27,7 @@ public enum ClientCommand {
                 exit(approved ? 0 : 1)
             } catch OTAError.authenticationFailed {
                 fputs(
-                    "Error: No PSK configured. Run 'ota-touchid pair <psk>' with the PSK from the server.\n",
+                    "Error: No PSK configured. Run 'ota-touchid setup' first.\n",
                     stderr)
                 exit(1)
             } catch {
@@ -77,6 +77,78 @@ public enum ClientCommand {
         }
         let hasPSK = (try? loadPSK()) != nil
         print("PSK: \(hasPSK ? "configured" : "NOT configured (required)")")
+    }
+
+    /// Set up client: try iCloud Keychain first, fall back to manual PSK entry.
+    public static func setupClient(pskBase64: String?) throws {
+        var psk = pskBase64
+
+        // Try iCloud Keychain if no PSK provided
+        if psk == nil {
+            if let keychainData = SyncedKeychain.read(account: .preSharedKey),
+               let keychainPSK = String(data: keychainData, encoding: .utf8)
+            {
+                fputs("Found PSK in iCloud Keychain.\n", stderr)
+                psk = keychainPSK
+            }
+        }
+
+        // Fall back to manual prompt
+        if psk == nil {
+            fputs("Enter PSK from server (base64): ", stderr)
+            guard let line = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !line.isEmpty
+            else {
+                fputs("Error: No PSK provided.\n", stderr)
+                exit(1)
+            }
+            psk = line
+        }
+
+        try pair(pskBase64: psk!)
+
+        // Try to get public key from iCloud Keychain (eliminates TOFU)
+        if let pubKeyData = SyncedKeychain.read(account: .serverPublicKey),
+           let pubKeyBase64 = String(data: pubKeyData, encoding: .utf8)
+        {
+            try trustKey(base64: pubKeyBase64)
+            fputs("Server public key imported from iCloud Keychain (TOFU skipped).\n", stderr)
+        }
+    }
+
+    /// Test connectivity without triggering Touch ID. Calls exit(0/1).
+    public static func test(host: String?, port: UInt16?) -> Never {
+        Task {
+            do {
+                let endpoint: NWEndpoint
+                if let host, let port {
+                    endpoint = NWEndpoint.hostPort(
+                        host: NWEndpoint.Host(host),
+                        port: NWEndpoint.Port(rawValue: port)!
+                    )
+                } else {
+                    fputs("Discovering server via Bonjour...\n", stderr)
+                    endpoint = try await discover()
+                    fputs("Found server: \(endpoint)\n", stderr)
+                }
+
+                let ok = try await requestTest(endpoint: endpoint)
+                if ok {
+                    print("Connection test passed.")
+                    exit(0)
+                } else {
+                    fputs("Connection test failed: server rejected request.\n", stderr)
+                    exit(1)
+                }
+            } catch OTAError.authenticationFailed {
+                fputs("Error: No PSK configured. Run 'ota-touchid setup' first.\n", stderr)
+                exit(1)
+            } catch {
+                fputs("Error: \(error.localizedDescription)\n", stderr)
+                exit(1)
+            }
+        }
+        dispatchMain()
     }
 }
 
@@ -264,4 +336,40 @@ private func requestAuth(endpoint: NWEndpoint, reason: String) async throws -> B
     try storePublicKey(pubBase64)
     fputs("Server key trusted and stored.\n", stderr)
     return true
+}
+
+// MARK: - Test Flow (PSK-only, no Touch ID)
+
+private func requestTest(endpoint: NWEndpoint) async throws -> Bool {
+    guard let psk = try loadPSK() else {
+        throw OTAError.authenticationFailed
+    }
+
+    var nonceBytes = [UInt8](repeating: 0, count: OTA.nonceSize)
+    guard SecRandomCopyBytes(kSecRandomDefault, OTA.nonceSize, &nonceBytes) == errSecSuccess else {
+        throw OTAError.keyGenerationFailed("SecRandomCopyBytes failed")
+    }
+    let nonce = Data(nonceBytes)
+    let proof = computeClientProof(psk: psk, nonce: nonce)
+
+    let request = AuthRequest(
+        nonce: nonce,
+        reason: "test",
+        hasStoredKey: true,
+        clientProof: proof,
+        mode: "test"
+    )
+    let frame = try Frame.encode(request)
+
+    let peerInfo = TLSPeerInfo()
+    let conn = try await asyncConnect(to: endpoint, using: TLSConfig.clientParameters(peerInfo: peerInfo))
+    defer { conn.cancel() }
+
+    try await asyncSend(frame, on: conn)
+    let response: AuthResponse = try await asyncReadFrame(AuthResponse.self, on: conn)
+
+    if !response.approved {
+        fputs("Server: \(response.error ?? "unknown error")\n", stderr)
+    }
+    return response.approved
 }

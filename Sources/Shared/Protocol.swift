@@ -83,12 +83,14 @@ public struct AuthRequest: Codable, Sendable {
     public let hostname: String
     public let hasStoredKey: Bool     // tells server whether to include pubkey in response
     public let clientProof: String?  // HMAC-SHA256(PSK, nonce), base64
+    public let mode: String?         // nil/"auth" = normal, "test" = PSK-only check
 
     public init(
         nonce: Data,
         reason: String,
         hasStoredKey: Bool = false,
-        clientProof: Data? = nil
+        clientProof: Data? = nil,
+        mode: String? = nil
     ) {
         self.version = OTA.protocolVersion
         self.nonce = nonce.base64EncodedString()
@@ -96,6 +98,7 @@ public struct AuthRequest: Codable, Sendable {
         self.hostname = ProcessInfo.processInfo.hostName
         self.hasStoredKey = hasStoredKey
         self.clientProof = clientProof?.base64EncodedString()
+        self.mode = mode
     }
 }
 
