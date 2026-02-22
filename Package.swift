@@ -9,7 +9,12 @@ let package = Package(
         .executable(name: "ota-client", targets: ["Client"]),
     ],
     targets: [
-        .target(name: "Shared"),
+        .target(
+            name: "Shared",
+            linkerSettings: [
+                .linkedFramework("Security"),
+            ]
+        ),
         .executableTarget(
             name: "Server",
             dependencies: ["Shared"],
@@ -20,6 +25,10 @@ let package = Package(
         ),
         .executableTarget(
             name: "Client",
+            dependencies: ["Shared"]
+        ),
+        .testTarget(
+            name: "SharedTests",
             dependencies: ["Shared"]
         ),
     ]

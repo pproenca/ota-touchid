@@ -4,47 +4,61 @@ import Network
 import Security
 import Shared
 
-// MARK: - Config
+// MARK: - Key Storage
 
 private let pubKeyFile = OTA.configDir.appendingPathComponent("server.pub")
 
 private func storePublicKey(_ base64: String) throws {
     guard Data(base64Encoded: base64) != nil else {
-        fputs("Error: invalid base64 public key.\n", stderr)
-        exit(1)
+        throw OTAError.badRequest("invalid base64 public key")
     }
-    try FileManager.default.createDirectory(at: OTA.configDir, withIntermediateDirectories: true)
-    try base64.write(to: pubKeyFile, atomically: true, encoding: .utf8)
+    let fm = FileManager.default
+    try fm.createDirectory(at: OTA.configDir, withIntermediateDirectories: true)
+    // [M4] Restrictive permissions — prevent other users from swapping the trusted key.
+    let tmpFile = OTA.configDir.appendingPathComponent(UUID().uuidString)
+    fm.createFile(
+        atPath: tmpFile.path,
+        contents: base64.data(using: .utf8),
+        attributes: [.posixPermissions: 0o600]
+    )
+    try fm.moveItem(at: tmpFile, to: pubKeyFile)
 }
 
-private func loadPublicKey() -> P256.Signing.PublicKey? {
-    guard let raw = try? String(contentsOf: pubKeyFile, encoding: .utf8),
-        let data = Data(base64Encoded: raw.trimmingCharacters(in: .whitespacesAndNewlines)),
-        let key = try? P256.Signing.PublicKey(rawRepresentation: data)
-    else { return nil }
-    return key
-}
-
-// MARK: - Async Network Helpers
-
-private enum OTAError: Error, LocalizedError {
-    case serverNotFound
-    case shortRead
-    case timeout
-
-    var errorDescription: String? {
-        switch self {
-        case .serverNotFound: "No OTA Touch ID server found on local network"
-        case .shortRead: "Connection closed unexpectedly"
-        case .timeout: "Request timed out"
-        }
+private func loadPublicKey() throws -> P256.Signing.PublicKey? {
+    guard FileManager.default.fileExists(atPath: pubKeyFile.path) else { return nil }
+    let raw = try String(contentsOf: pubKeyFile, encoding: .utf8)
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    guard let data = Data(base64Encoded: raw) else {
+        throw OTAError.badRequest("stored public key is not valid base64")
     }
+    return try P256.Signing.PublicKey(rawRepresentation: data)
 }
+
+// MARK: - PSK [C2]
+
+private func loadPSK() throws -> SymmetricKey? {
+    let pskFile = OTA.pskFile
+    guard FileManager.default.fileExists(atPath: pskFile.path) else { return nil }
+    let raw = try String(contentsOf: pskFile, encoding: .utf8)
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    guard let data = Data(base64Encoded: raw), data.count == 32 else {
+        throw OTAError.badRequest("stored PSK is invalid (expected 32-byte base64)")
+    }
+    return SymmetricKey(data: data)
+}
+
+private func computeClientProof(psk: SymmetricKey, nonce: Data) -> Data {
+    let mac = HMAC<SHA256>.authenticationCode(for: nonce, using: psk)
+    return Data(mac)
+}
+
+// MARK: - Bonjour Discovery
 
 private func discover(timeout: TimeInterval = 5) async throws -> NWEndpoint {
     try await withCheckedThrowingContinuation { cont in
         let browser = NWBrowser(for: .bonjour(type: OTA.serviceType, domain: nil), using: .tcp)
-        var done = false
+        // Safe: all callbacks dispatched to .main, so `done` is accessed serially.
+        nonisolated(unsafe) var done = false
 
         browser.browseResultsChangedHandler = { results, _ in
             guard !done, let result = results.first else { return }
@@ -71,74 +85,62 @@ private func discover(timeout: TimeInterval = 5) async throws -> NWEndpoint {
     }
 }
 
-private func connect(to endpoint: NWEndpoint) async throws -> NWConnection {
-    let conn = NWConnection(to: endpoint, using: .tcp)
-    return try await withCheckedThrowingContinuation { cont in
-        var done = false
-        conn.stateUpdateHandler = { state in
-            guard !done else { return }
-            switch state {
-            case .ready:
-                done = true
-                cont.resume(returning: conn)
-            case .failed(let error):
-                done = true
-                cont.resume(throwing: error)
-            default:
-                break
-            }
-        }
-        conn.start(queue: .main)
-    }
+// MARK: - TOFU Confirmation [H1]
+
+private func confirmTOFU(fingerprint: String) -> Bool {
+    fputs(
+        """
+        \n*** First connection to this server ***
+        WARNING: Verify this fingerprint matches the server's output.
+        An attacker on the local network could be impersonating the server.
+        For high-security environments, use --setup with the server's public key instead.
+
+        Server key fingerprint: \(fingerprint)
+        Trust this key? [y/N] \u{0}
+        """, stderr)
+    guard let line = readLine()?.lowercased() else { return false }
+    return line == "y" || line == "yes"
 }
 
-private func send(_ data: Data, on conn: NWConnection) async throws {
-    try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-        conn.send(content: data, completion: .contentProcessed { error in
-            if let error { cont.resume(throwing: error) } else { cont.resume() }
-        })
-    }
-}
-
-private func receive(exactly count: Int, on conn: NWConnection) async throws -> Data {
-    try await withCheckedThrowingContinuation { cont in
-        conn.receive(minimumIncompleteLength: count, maximumLength: count) {
-            data, _, _, error in
-            if let data, data.count == count {
-                cont.resume(returning: data)
-            } else {
-                cont.resume(throwing: error ?? OTAError.shortRead)
-            }
-        }
-    }
+// [L5] 16-byte fingerprint matching SSH conventions (was 8 bytes).
+private func keyFingerprint(_ keyData: Data) -> String {
+    let hash = SHA256.hash(data: keyData)
+    return hash.prefix(16).map { String(format: "%02x", $0) }.joined(separator: ":")
 }
 
 // MARK: - Auth Flow
 
 private func requestAuth(endpoint: NWEndpoint, reason: String) async throws -> Bool {
+    // [C2] PSK is required for client authentication
+    guard let psk = try loadPSK() else {
+        throw OTAError.authenticationFailed
+    }
+
     // Generate cryptographic nonce
-    var nonceBytes = [UInt8](repeating: 0, count: 32)
-    guard SecRandomCopyBytes(kSecRandomDefault, 32, &nonceBytes) == errSecSuccess else {
-        fputs("Error: failed to generate nonce.\n", stderr)
-        return false
+    var nonceBytes = [UInt8](repeating: 0, count: OTA.nonceSize)
+    guard SecRandomCopyBytes(kSecRandomDefault, OTA.nonceSize, &nonceBytes) == errSecSuccess else {
+        throw OTAError.keyGenerationFailed("SecRandomCopyBytes failed")
     }
     let nonce = Data(nonceBytes)
 
-    let request = AuthRequest(nonce: nonce, reason: reason)
+    let hasStoredKey = (try? loadPublicKey()) != nil
+    let proof = computeClientProof(psk: psk, nonce: nonce)
+
+    let request = AuthRequest(
+        nonce: nonce,
+        reason: reason,
+        hasStoredKey: hasStoredKey,
+        clientProof: proof
+    )
     let frame = try Frame.encode(request)
 
-    // Connect and exchange
-    let conn = try await connect(to: endpoint)
+    // [M2/H2] Capture peer TLS cert fingerprint for channel binding
+    let peerInfo = TLSPeerInfo()
+    let conn = try await asyncConnect(to: endpoint, using: TLSConfig.clientParameters(peerInfo: peerInfo))
     defer { conn.cancel() }
 
-    try await send(frame, on: conn)
-
-    let lenData = try await receive(exactly: 4, on: conn)
-    let length = Int(lenData.withUnsafeBytes { $0.load(as: UInt32.self).bigEndian })
-    guard (1...65536).contains(length) else { throw OTAError.shortRead }
-
-    let payload = try await receive(exactly: length, on: conn)
-    let response = try Frame.decode(AuthResponse.self, from: payload)
+    try await asyncSend(frame, on: conn)
+    let response: AuthResponse = try await asyncReadFrame(AuthResponse.self, on: conn)
 
     guard response.approved,
         let sigBase64 = response.signature,
@@ -150,109 +152,166 @@ private func requestAuth(endpoint: NWEndpoint, reason: String) async throws -> B
 
     let signature = try P256.Signing.ECDSASignature(rawRepresentation: sigRaw)
 
+    // [M2] Channel binding: verify signature over nonce + TLS cert fingerprint.
+    // A MITM with a different TLS certificate produces a different fingerprint,
+    // causing signature verification to fail even if they relay to the real server.
+    guard let certFP = peerInfo.certFingerprint else {
+        throw OTAError.signatureVerificationFailed
+    }
+    let signedData = nonce + certFP
+
     // Verify against stored key
-    if let storedKey = loadPublicKey() {
-        return storedKey.isValidSignature(signature, for: nonce)
-    }
-
-    // TOFU: trust on first use — accept and store the server's public key
-    if let pubBase64 = response.publicKey,
-        let pubRaw = Data(base64Encoded: pubBase64)
-    {
-        let key = try P256.Signing.PublicKey(rawRepresentation: pubRaw)
-        if key.isValidSignature(signature, for: nonce) {
-            try storePublicKey(pubBase64)
-            fputs("Trusted server key (first use): \(pubBase64.prefix(16))...\n", stderr)
-            return true
+    if let storedKey = try loadPublicKey() {
+        guard storedKey.isValidSignature(signature, for: signedData) else {
+            throw OTAError.signatureVerificationFailed
         }
+        return true
     }
 
-    fputs("Signature verification failed.\n", stderr)
-    return false
+    // TOFU: trust on first use — verify signature, then ask user
+    guard let pubBase64 = response.publicKey,
+        let pubRaw = Data(base64Encoded: pubBase64)
+    else {
+        throw OTAError.signatureVerificationFailed
+    }
+
+    let key = try P256.Signing.PublicKey(rawRepresentation: pubRaw)
+    guard key.isValidSignature(signature, for: signedData) else {
+        throw OTAError.signatureVerificationFailed
+    }
+
+    guard confirmTOFU(fingerprint: keyFingerprint(pubRaw)) else {
+        fputs("Connection aborted by user.\n", stderr)
+        return false
+    }
+
+    try storePublicKey(pubBase64)
+    fputs("Server key trusted and stored.\n", stderr)
+    return true
 }
 
 // MARK: - CLI
 
-let args = CommandLine.arguments
+private func parseArgs() throws -> (action: Action, reason: String) {
+    let args = CommandLine.arguments
 
-if args.contains("--help") || args.contains("-h") {
-    print("""
-        OTA Touch ID Client
-
-        Usage:
-          ota-client                              Authenticate via Bonjour discovery
-          ota-client --reason "sudo"              Custom reason shown in Touch ID prompt
-          ota-client --host <ip> --port <port>    Direct connection (skip Bonjour)
-          ota-client --setup <base64-public-key>  Manually trust a server key
-          ota-client --status                     Show stored server key
-
-        Exit codes:
-          0  Approved (Touch ID succeeded, signature valid)
-          1  Denied or error
-        """)
-    exit(0)
-}
-
-if args.contains("--status") {
-    if let key = loadPublicKey() {
-        print("Trusted server key: \(key.rawRepresentation.base64EncodedString())")
-    } else {
-        print("No trusted server key. Will use TOFU on first connection.")
+    if args.contains("--help") || args.contains("-h") {
+        return (.help, "")
     }
-    exit(0)
-}
 
-if let idx = args.firstIndex(of: "--setup"), idx + 1 < args.count {
-    try storePublicKey(args[idx + 1])
-    print("Server public key stored.")
-    exit(0)
-}
+    if args.contains("--status") {
+        return (.status, "")
+    }
 
-let reason: String = {
+    if let idx = args.firstIndex(of: "--setup"), idx + 1 < args.count {
+        return (.setup(args[idx + 1]), "")
+    }
+
+    let reason: String
     if let idx = args.firstIndex(of: "--reason"), idx + 1 < args.count {
-        return args[idx + 1]
+        reason = args[idx + 1]
+    } else {
+        reason = "authentication"
     }
-    return "authentication"
-}()
 
-let directHost: String? = {
-    if let idx = args.firstIndex(of: "--host"), idx + 1 < args.count {
-        return args[idx + 1]
+    if let hostIdx = args.firstIndex(of: "--host"), hostIdx + 1 < args.count {
+        let host = args[hostIdx + 1]
+        guard let portIdx = args.firstIndex(of: "--port"), portIdx + 1 < args.count else {
+            throw OTAError.badRequest("--host requires --port")
+        }
+        guard let port = UInt16(args[portIdx + 1]) else {
+            throw OTAError.invalidPort(args[portIdx + 1])
+        }
+        let endpoint = NWEndpoint.hostPort(
+            host: NWEndpoint.Host(host),
+            port: NWEndpoint.Port(rawValue: port)!  // UInt16 always valid
+        )
+        return (.direct(endpoint), reason)
     }
-    return nil
-}()
 
-let directPort: UInt16? = {
-    if let idx = args.firstIndex(of: "--port"), idx + 1 < args.count {
-        return UInt16(args[idx + 1])
-    }
-    return nil
-}()
+    return (.discover, reason)
+}
 
-Task {
-    do {
-        let endpoint: NWEndpoint
+private enum Action {
+    case help
+    case status
+    case setup(String)
+    case discover
+    case direct(NWEndpoint)
+}
 
-        if let host = directHost {
-            guard let port = directPort else {
-                fputs("--host requires --port\n", stderr)
+private let helpText = """
+    OTA Touch ID Client
+
+    Usage:
+      ota-client                              Authenticate via Bonjour discovery
+      ota-client --reason "sudo"              Custom reason shown in Touch ID prompt
+      ota-client --host <ip> --port <port>    Direct connection (skip Bonjour)
+      ota-client --setup <base64-public-key>  Manually trust a server key
+      ota-client --status                     Show stored server key & PSK status
+
+    Setup:
+      Copy the PSK from the server output to ~/.config/ota-touchid/psk
+
+    Exit codes:
+      0  Approved (Touch ID succeeded, signature valid)
+      1  Denied or error
+    """
+
+// MARK: - Entry Point
+
+do {
+    let (action, reason) = try parseArgs()
+
+    switch action {
+    case .help:
+        print(helpText)
+        exit(0)
+
+    case .status:
+        if let key = try loadPublicKey() {
+            let fp = keyFingerprint(key.rawRepresentation)
+            print("Trusted server key: \(key.rawRepresentation.base64EncodedString())")
+            print("Fingerprint: \(fp)")
+        } else {
+            print("No trusted server key. Will use TOFU on first connection.")
+        }
+        let hasPSK = (try? loadPSK()) != nil
+        print("PSK: \(hasPSK ? "configured" : "NOT configured (required)")")
+        exit(0)
+
+    case .setup(let base64):
+        try storePublicKey(base64)
+        print("Server public key stored.")
+        exit(0)
+
+    case .discover, .direct:
+        Task {
+            do {
+                let endpoint: NWEndpoint
+                if case .direct(let ep) = action {
+                    endpoint = ep
+                } else {
+                    fputs("Discovering server via Bonjour...\n", stderr)
+                    endpoint = try await discover()
+                    fputs("Found server: \(endpoint)\n", stderr)
+                }
+
+                let approved = try await requestAuth(endpoint: endpoint, reason: reason)
+                exit(approved ? 0 : 1)
+            } catch OTAError.authenticationFailed {
+                fputs(
+                    "Error: No PSK configured. Copy the PSK from the server to ~/.config/ota-touchid/psk\n",
+                    stderr)
+                exit(1)
+            } catch {
+                fputs("Error: \(error.localizedDescription)\n", stderr)
                 exit(1)
             }
-            endpoint = .hostPort(
-                host: NWEndpoint.Host(host),
-                port: NWEndpoint.Port(rawValue: port)!)
-        } else {
-            fputs("Discovering server via Bonjour...\n", stderr)
-            endpoint = try await discover()
-            fputs("Found server: \(endpoint)\n", stderr)
         }
-
-        let approved = try await requestAuth(endpoint: endpoint, reason: reason)
-        exit(approved ? 0 : 1)
-    } catch {
-        fputs("Error: \(error.localizedDescription)\n", stderr)
-        exit(1)
+        dispatchMain()
     }
+} catch {
+    fputs("Error: \(error.localizedDescription)\n", stderr)
+    exit(1)
 }
-
-dispatchMain()
