@@ -27,13 +27,13 @@ On the Mac with Touch ID (server):
 ota-touchid setup
 ```
 
-This generates keys, creates a PSK, and installs a launchd agent. Copy the PSK from the output.
+This installs the launchd service and prints a one-line pairing token.
 
 On the remote Mac (client):
 
 ```bash
-ota-touchid pair <psk>
-ota-touchid trust <server-public-key-base64>
+ota-touchid pair <pairing-bundle>
+ota-touchid test
 ota-touchid auth --reason sudo
 ```
 
@@ -42,7 +42,7 @@ ota-touchid auth --reason sudo
 | Command | What it does |
 |---|---|
 | `setup` | Generate keys, install server as launchd agent |
-| `pair <psk>` / `pair --stdin` | Save PSK on client machine |
+| `pair <pairing-bundle\|psk>` / `pair --stdin` | Import pairing data on client |
 | `trust <server-public-key-base64>` | Pin trusted server key on client |
 | `auth` | Authenticate via Touch ID (exit 0=ok, 1=denied) |
 | `test` | Verify secure connectivity and server authenticity |
@@ -54,7 +54,8 @@ ota-touchid auth --reason sudo
 
 ```
 --reason <text>              Reason shown in Touch ID prompt (default: "authentication")
---host <ip> --port <port>    Direct connection (skip Bonjour discovery)
+--host <ip-or-hostname>       Direct connection (skip Bonjour discovery)
+--port <port>                 Optional with --host (default: 45821)
 --allow-tofu                 Explicitly allow trust-on-first-use for this auth attempt
 ```
 
@@ -62,19 +63,20 @@ ota-touchid auth --reason sudo
 
 1. **Server** runs on a Mac with Touch ID. On `setup`, it creates a P256 key pair in the Secure Enclave and a pre-shared key (PSK) for client authentication.
 
-2. **Client** discovers the server via Bonjour (or connects directly). It proves it knows the PSK, then requests authentication.
+2. **Client** discovers the server via Bonjour (or uses direct/cached endpoint). It sends an authenticated request transcript MAC (HMAC-SHA256 over mode + nonce + reason + hostname + flags).
 
-3. **Server** shows a Touch ID prompt. On approval, it signs the client's nonce with the Secure Enclave key and returns the signature.
+3. **Server** validates the request MAC. For auth mode, it prompts Touch ID and signs a transcript payload (`nonceC || nonceS || reasonDigest || channelBinding`) using Secure Enclave.
 
-4. **Client** verifies the signature against a pinned server public key and exits 0 (approved) or 1 (denied).
+4. **Client** verifies response MAC (PSK + TLS channel binding) and then verifies Secure Enclave signature against pinned server key.
 
 All traffic is TLS-encrypted with channel binding to prevent MITM attacks. The server rate-limits requests and logs every authentication event to `~/.config/ota-touchid/audit.log`.
 
 ## Security
 
 - **Secure Enclave** — signing key never leaves hardware
-- **TLS** — all traffic encrypted, channel binding via certificate fingerprint
-- **PSK authentication** — clients must prove possession of the pre-shared key before Touch ID is triggered
+- **TLS** — all traffic encrypted
+- **Transcript MACs** — request/response integrity authenticated with HMAC-SHA256
+- **Channel binding** — response MAC/signature include TLS certificate fingerprint
 - **Pinned server key** — client requires an explicit trusted server key; TOFU is opt-in per command (`--allow-tofu`)
 - **Rate limiting** — 5 attempts per source per 60 seconds
 - **Audit log** — every request logged with timestamp and source

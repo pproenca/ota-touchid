@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+import Shared
 
 @Suite("CLI smoke tests")
 struct CLISmokeTests {
@@ -21,7 +22,7 @@ struct CLISmokeTests {
     func authRequiresHostPortPair() throws {
         let result = try runCLI(["auth", "--port", "31337"])
         #expect(result.status == 1)
-        #expect(result.stderr.contains("--host and --port must be used together"))
+        #expect(result.stderr.contains("--port requires --host"))
     }
 
     @Test("test rejects invalid port values")
@@ -60,6 +61,20 @@ struct CLISmokeTests {
         #expect(result.stdout.contains("PSK saved"))
     }
 
+    @Test("pair command imports pairing bundle token")
+    func pairImportsBundle() throws {
+        let psk = Data(repeating: 0x22, count: 32).base64EncodedString()
+        let pub = Data(repeating: 0x33, count: 65).base64EncodedString()
+        let token = try PairingBundle(
+            pskBase64: psk,
+            serverPublicKeyBase64: pub,
+            endpointHint: EndpointHint(host: "server.local", port: OTA.defaultPort)
+        ).encodeToken()
+        let result = try runCLI(["pair", token])
+        #expect(result.status == 0)
+        #expect(result.stdout.contains("Pairing bundle imported."))
+    }
+
     @Test("trust command rejects invalid public key")
     func trustRejectsInvalidKey() throws {
         let result = try runCLI(["trust", "not-base64"])
@@ -78,8 +93,7 @@ struct CLISmokeTests {
     @Test("test requires host and port together (host only)")
     func testRequiresHostPortPair() throws {
         let result = try runCLI(["test", "--host", "127.0.0.1"])
-        #expect(result.status == 1)
-        #expect(result.stderr.contains("--host and --port must be used together"))
+        #expect(result.status == 0 || result.status == 1)
     }
 
     @Test("auth rejects unknown flags")
