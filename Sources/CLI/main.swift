@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import ServerLib
 import ClientLib
 import Shared
@@ -196,13 +197,9 @@ enum SetupCommand {
                 fputs("Clients on other Macs will need the PSK manually.\n", stderr)
             }
 
-            // Resolve binary path for launchd plist
-            let binaryPath: String
-            if let resolved = resolveRealBinaryPath() {
-                binaryPath = resolved
-            } else {
-                binaryPath = CommandLine.arguments[0]
-            }
+            // Use a stable launcher path (e.g. /opt/homebrew/bin/ota-touchid),
+            // so upgrades do not break launchd plist paths.
+            let binaryPath = resolveLaunchdBinaryPath()
 
             // Write launchd plist
             let plistDir = FileManager.default.homeDirectoryForCurrentUser
@@ -302,13 +299,13 @@ enum SetupCommand {
         }
     }
 
-    private static func resolveRealBinaryPath() -> String? {
+    private static func resolveLaunchdBinaryPath() -> String {
         let arg0 = CommandLine.arguments[0]
-        // If it's already absolute, resolve symlinks to an absolute path
-        if arg0.hasPrefix("/") {
-            return URL(fileURLWithPath: arg0).resolvingSymlinksInPath().path
+        // If invoked with an absolute path, keep it as-is (do not resolve symlinks).
+        if arg0.hasPrefix("/"), FileManager.default.isExecutableFile(atPath: arg0) {
+            return arg0
         }
-        // Try to find via `which`, then resolve symlinks
+        // Prefer PATH lookup (typically /opt/homebrew/bin/ota-touchid symlink).
         let which = Process()
         which.executableURL = URL(fileURLWithPath: "/usr/bin/which")
         which.arguments = ["ota-touchid"]
@@ -318,8 +315,14 @@ enum SetupCommand {
         which.waitUntilExit()
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         let path = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let path, !path.isEmpty else { return nil }
-        return URL(fileURLWithPath: path).resolvingSymlinksInPath().path
+        if let path, !path.isEmpty, FileManager.default.isExecutableFile(atPath: path) {
+            return path
+        }
+        // Last-resort fallback for relative invocation.
+        let cwd = FileManager.default.currentDirectoryPath
+        let absolute = URL(fileURLWithPath: arg0, relativeTo: URL(fileURLWithPath: cwd))
+            .standardizedFileURL.path
+        return absolute
     }
 
     private static func launchdPlist(binaryPath: String) -> String {
@@ -426,9 +429,10 @@ enum StatusCommand {
 
         // LaunchD service
         print("")
+        let uid = getuid()
         let list = Process()
         list.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-        list.arguments = ["list", "com.ota-touchid.server"]
+        list.arguments = ["print", "gui/\(uid)/com.ota-touchid.server"]
         let pipe = Pipe()
         list.standardOutput = pipe
         list.standardError = Pipe()  // suppress stderr

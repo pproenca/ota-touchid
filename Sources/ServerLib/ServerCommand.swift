@@ -212,10 +212,24 @@ private final class Server: @unchecked Sendable {
 
     func start() {
         listener.stateUpdateHandler = { state in
-            if case .ready = state, let port = self.listener.port {
+            switch state {
+            case .ready:
+                guard let port = self.listener.port else { return }
                 log("Listening on port \(port.rawValue)")
                 log("Advertising via Bonjour (\(OTA.serviceType))")
                 log("Waiting for auth requests...")
+            case .waiting(let error):
+                logErr("Listener waiting: \(error.localizedDescription)")
+            case .failed(let error):
+                logErr("Listener failed: \(error.localizedDescription)")
+                auditLog("LISTENER_FAILED error=\(error.localizedDescription)")
+                self.listener.cancel()
+                // Let launchd KeepAlive restart the process.
+                exit(1)
+            case .cancelled:
+                logErr("Listener cancelled.")
+            default:
+                break
             }
         }
 
