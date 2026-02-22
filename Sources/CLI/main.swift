@@ -69,6 +69,19 @@ case "auth":
     }
     ClientCommand.auth(reason: reason, host: host, port: port)
 
+case "pair":
+    guard args.count == 2 else {
+        fputs("Usage: ota-touchid pair <psk-base64>\n", stderr)
+        exit(1)
+    }
+    do {
+        try ClientCommand.pair(pskBase64: args[1])
+        exit(0)
+    } catch {
+        fputs("Error: \(error.localizedDescription)\n", stderr)
+        exit(1)
+    }
+
 case "status":
     StatusCommand.run()
 
@@ -458,6 +471,9 @@ func printUsage() {
           ota-touchid setup [--server | --client] [--psk <base64>]
               Interactive install. Sets up server (Touch ID Mac) or client (remote Mac).
               Same-Apple-ID devices auto-pair via iCloud Keychain.
+
+          ota-touchid pair <psk-base64>
+              Store a PSK on this client for manual pairing.
 
           ota-touchid test [--host <ip> --port <port>]
               Verify connectivity to server (no Touch ID prompt).

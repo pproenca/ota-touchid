@@ -126,4 +126,41 @@ struct SourceRateLimiterTests {
         // c is unaffected
         #expect(limiter.shouldAllow(source: "c"))
     }
+
+    @Test("evicts oldest source when maxTrackedSources is reached")
+    func evictsOldestTrackedSource() {
+        var now = Date(timeIntervalSince1970: 2_000_000)
+        let limiter = SourceRateLimiter(
+            maxAttempts: 1,
+            windowSeconds: 60,
+            maxTrackedSources: 2
+        ) { now }
+
+        #expect(limiter.shouldAllow(source: "a"))
+        #expect(limiter.shouldAllow(source: "a") == false)
+
+        now = now.addingTimeInterval(1)
+        #expect(limiter.shouldAllow(source: "b"))
+        now = now.addingTimeInterval(1)
+        #expect(limiter.shouldAllow(source: "c"))  // evicts oldest tracked source ("a")
+
+        #expect(limiter.shouldAllow(source: "a"))  // fresh after eviction
+    }
+
+    @Test("expired entries are pruned before evaluating new sources")
+    func prunesExpiredEntries() {
+        var now = Date(timeIntervalSince1970: 3_000_000)
+        let limiter = SourceRateLimiter(
+            maxAttempts: 1,
+            windowSeconds: 10,
+            maxTrackedSources: 2
+        ) { now }
+
+        #expect(limiter.shouldAllow(source: "a"))
+        #expect(limiter.shouldAllow(source: "b"))
+
+        now = now.addingTimeInterval(11)  // both entries expired
+        #expect(limiter.shouldAllow(source: "c"))
+        #expect(limiter.shouldAllow(source: "a"))
+    }
 }

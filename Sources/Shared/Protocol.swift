@@ -7,6 +7,7 @@ public enum OTA {
     public static let nonceSize = 32
     public static let maxFrameSize = 65_536
     public static let protocolVersion = 1
+    public static let networkTimeoutSeconds: TimeInterval = 5
 
     public static var configDir: URL {
         FileManager.default.homeDirectoryForCurrentUser
@@ -159,14 +160,28 @@ public func asyncConnect(to endpoint: NWEndpoint, using params: NWParameters) as
     return try await withCheckedThrowingContinuation { cont in
         // Safe: all callbacks dispatched to .main, so `resumed` is accessed serially.
         nonisolated(unsafe) var resumed = false
+        let timeout = DispatchWorkItem {
+            guard !resumed else { return }
+            resumed = true
+            conn.cancel()
+            cont.resume(throwing: OTAError.timeout)
+        }
+
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + OTA.networkTimeoutSeconds,
+            execute: timeout
+        )
+
         conn.stateUpdateHandler = { state in
             guard !resumed else { return }
             switch state {
             case .ready:
                 resumed = true
+                timeout.cancel()
                 cont.resume(returning: conn)
             case .failed(let error):
                 resumed = true
+                timeout.cancel()
                 cont.resume(throwing: error)
             default:
                 break
@@ -178,16 +193,52 @@ public func asyncConnect(to endpoint: NWEndpoint, using params: NWParameters) as
 
 public func asyncSend(_ data: Data, on conn: NWConnection) async throws {
     try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+        // Safe: all callbacks dispatched to .main, so `resumed` is accessed serially.
+        nonisolated(unsafe) var resumed = false
+        let timeout = DispatchWorkItem {
+            guard !resumed else { return }
+            resumed = true
+            conn.cancel()
+            cont.resume(throwing: OTAError.timeout)
+        }
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + OTA.networkTimeoutSeconds,
+            execute: timeout
+        )
+
         conn.send(content: data, completion: .contentProcessed { error in
-            if let error { cont.resume(throwing: error) } else { cont.resume() }
+            guard !resumed else { return }
+            resumed = true
+            timeout.cancel()
+            if let error {
+                cont.resume(throwing: error)
+            } else {
+                cont.resume()
+            }
         })
     }
 }
 
 public func asyncReceive(exactly count: Int, on conn: NWConnection) async throws -> Data {
     try await withCheckedThrowingContinuation { cont in
+        // Safe: all callbacks dispatched to .main, so `resumed` is accessed serially.
+        nonisolated(unsafe) var resumed = false
+        let timeout = DispatchWorkItem {
+            guard !resumed else { return }
+            resumed = true
+            conn.cancel()
+            cont.resume(throwing: OTAError.timeout)
+        }
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + OTA.networkTimeoutSeconds,
+            execute: timeout
+        )
+
         conn.receive(minimumIncompleteLength: count, maximumLength: count) {
             data, _, _, error in
+            guard !resumed else { return }
+            resumed = true
+            timeout.cancel()
             if let data, data.count == count {
                 cont.resume(returning: data)
             } else {

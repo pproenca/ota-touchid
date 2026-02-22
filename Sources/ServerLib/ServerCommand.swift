@@ -230,8 +230,18 @@ private final class Server: @unchecked Sendable {
     // MARK: Framed read
 
     private func readFrame(_ conn: NWConnection) {
-        conn.receive(minimumIncompleteLength: 4, maximumLength: 4) { [weak self] data, _, _, _ in
-            guard let self, let data else { conn.cancel(); return }
+        receiveExactly(4, on: conn) { [weak self] result in
+            guard let self else { conn.cancel(); return }
+
+            let data: Data
+            switch result {
+            case .success(let payload):
+                data = payload
+            case .failure(let error):
+                logErr("  frame read error: \(error.localizedDescription)")
+                conn.cancel()
+                return
+            }
 
             let length: Int
             do {
@@ -247,18 +257,51 @@ private final class Server: @unchecked Sendable {
     }
 
     private func readPayload(_ conn: NWConnection, length: Int) {
-        conn.receive(minimumIncompleteLength: length, maximumLength: length) {
-            [weak self] data, _, _, _ in
-            guard let self, let data else { conn.cancel(); return }
-            self.handleRequest(data, on: conn)
+        receiveExactly(length, on: conn) { [weak self] result in
+            guard let self else { conn.cancel(); return }
+            switch result {
+            case .success(let data):
+                self.handleRequest(data, on: conn)
+            case .failure(let error):
+                logErr("  payload read error: \(error.localizedDescription)")
+                conn.cancel()
+            }
+        }
+    }
+
+    private func receiveExactly(
+        _ count: Int,
+        on conn: NWConnection,
+        timeout: TimeInterval = OTA.networkTimeoutSeconds,
+        completion: @escaping (Result<Data, Error>) -> Void
+    ) {
+        // Safe: callbacks run on `.main`, so `done` is serially accessed.
+        nonisolated(unsafe) var done = false
+        let timeoutItem = DispatchWorkItem {
+            guard !done else { return }
+            done = true
+            conn.cancel()
+            completion(.failure(OTAError.timeout))
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + timeout, execute: timeoutItem)
+
+        conn.receive(minimumIncompleteLength: count, maximumLength: count) { data, _, _, error in
+            guard !done else { return }
+            done = true
+            timeoutItem.cancel()
+            if let data, data.count == count {
+                completion(.success(data))
+            } else {
+                completion(.failure(error ?? OTAError.shortRead))
+            }
         }
     }
 
     // MARK: Connection info [M5]
 
     private func sourceLabel(for conn: NWConnection) -> String {
-        if case .hostPort(let host, let port) = conn.currentPath?.remoteEndpoint {
-            return "\(host):\(port)"
+        if case .hostPort(let host, _) = conn.currentPath?.remoteEndpoint {
+            return "\(host)"
         }
         return "unknown"
     }
