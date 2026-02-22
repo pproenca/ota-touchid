@@ -43,6 +43,7 @@ case "auth":
     var reason = "authentication"
     var host: String?
     var port: UInt16?
+    var allowTOFU = false
     var i = 1
     while i < args.count {
         switch args[i] {
@@ -57,6 +58,8 @@ case "auth":
                 exit(1)
             }
             port = p
+        case "--allow-tofu":
+            allowTOFU = true
         default:
             fputs("Unknown option: \(args[i])\n", stderr)
             exit(1)
@@ -67,15 +70,41 @@ case "auth":
         fputs("Error: --host and --port must be used together\n", stderr)
         exit(1)
     }
-    ClientCommand.auth(reason: reason, host: host, port: port)
+    ClientCommand.auth(reason: reason, host: host, port: port, allowTOFU: allowTOFU)
 
 case "pair":
-    guard args.count == 2 else {
-        fputs("Usage: ota-touchid pair <psk-base64>\n", stderr)
+    let pskInput: String
+    if args.count == 2, args[1] != "--stdin" {
+        pskInput = args[1]
+    } else if args.count == 2, args[1] == "--stdin" {
+        guard
+            let line = readLine(strippingNewline: true)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+            !line.isEmpty
+        else {
+            fputs("Error: No PSK data received on stdin.\n", stderr)
+            exit(1)
+        }
+        pskInput = line
+    } else {
+        fputs("Usage: ota-touchid pair <psk-base64> | ota-touchid pair --stdin\n", stderr)
         exit(1)
     }
     do {
-        try ClientCommand.pair(pskBase64: args[1])
+        try ClientCommand.pair(pskBase64: pskInput)
+        exit(0)
+    } catch {
+        fputs("Error: \(error.localizedDescription)\n", stderr)
+        exit(1)
+    }
+
+case "trust":
+    guard args.count == 2 else {
+        fputs("Usage: ota-touchid trust <server-public-key-base64>\n", stderr)
+        exit(1)
+    }
+    do {
+        try ClientCommand.trustKey(base64: args[1])
         exit(0)
     } catch {
         fputs("Error: \(error.localizedDescription)\n", stderr)
@@ -245,6 +274,7 @@ enum SetupCommand {
             print("")
             print("To set up a client Mac (different Apple ID — manual PSK):")
             print("  ota-touchid setup --client --psk \(config.pskBase64)")
+            print("  ota-touchid trust \(config.publicKeyBase64)")
             print("")
             print("Then verify with:")
             print("  ota-touchid test")
@@ -475,10 +505,16 @@ func printUsage() {
           ota-touchid pair <psk-base64>
               Store a PSK on this client for manual pairing.
 
+          ota-touchid pair --stdin
+              Read PSK from stdin (safer than command-line history).
+
+          ota-touchid trust <server-public-key-base64>
+              Pin the server public key on this client.
+
           ota-touchid test [--host <ip> --port <port>]
               Verify connectivity to server (no Touch ID prompt).
 
-          ota-touchid auth [--reason <text>] [--host <ip> --port <port>]
+          ota-touchid auth [--reason <text>] [--host <ip> --port <port>] [--allow-tofu]
               Authenticate via Touch ID. Exit 0 = approved, 1 = denied.
 
           ota-touchid status

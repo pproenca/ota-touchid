@@ -3,7 +3,7 @@ import Foundation
 
 /// Result of validating an incoming AuthRequest frame.
 public enum ValidatedRequest {
-    case test(hostname: String, source: String)
+    case test(nonce: Data, hostname: String, source: String)
     case auth(nonce: Data, hostname: String, hasStoredKey: Bool, source: String)
 }
 
@@ -35,7 +35,7 @@ public func validateAuthRequest(
 
     // Route by mode
     if req.mode == "test" {
-        return .test(hostname: req.hostname, source: source)
+        return .test(nonce: nonce, hostname: req.hostname, source: source)
     }
 
     return .auth(nonce: nonce, hostname: req.hostname, hasStoredKey: req.hasStoredKey, source: source)

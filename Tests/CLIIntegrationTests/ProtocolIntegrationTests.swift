@@ -65,6 +65,7 @@ struct ProtocolIntegrationTests {
     @Test("test mode round-trip")
     func testModeRoundTrip() throws {
         let nonce = Data(repeating: 0xBB, count: OTA.nonceSize)
+        let certFP = Data(repeating: 0xCC, count: 32)
         let proof = AuthProof.compute(psk: psk, nonce: nonce)
         let request = AuthRequest(
             nonce: nonce,
@@ -84,18 +85,31 @@ struct ProtocolIntegrationTests {
             source: "10.0.0.2:9999"
         )
 
-        guard case .test(_, let source) = validated else {
+        guard case .test(let validatedNonce, _, let source) = validated else {
             Issue.record("Expected .test variant")
             return
         }
+        #expect(validatedNonce == nonce)
         #expect(source == "10.0.0.2:9999")
 
-        // Server responds with simple approval (no signature needed for test mode)
-        let response = AuthResponse(approved: true)
+        // Server responds with a PSK proof bound to nonce and TLS cert fingerprint.
+        let testProof = AuthProof.computeTestServerProof(
+            psk: psk,
+            nonce: nonce,
+            certFingerprint: certFP
+        )
+        let response = AuthResponse(approved: true, testProof: testProof)
         let responseFrame = try Frame.encode(response)
         let decoded = try Frame.decode(AuthResponse.self, from: Data(responseFrame.suffix(from: 4)))
         #expect(decoded.approved == true)
         #expect(decoded.signature == nil)
+        #expect(decoded.testProof != nil)
+        #expect(AuthProof.verifyTestServerProof(
+            proofBase64: decoded.testProof,
+            psk: psk,
+            nonce: nonce,
+            certFingerprint: certFP
+        ))
     }
 
     @Test("denied response round-trip")
@@ -106,6 +120,7 @@ struct ProtocolIntegrationTests {
         #expect(decoded.approved == false)
         #expect(decoded.error == "Authentication denied")
         #expect(decoded.signature == nil)
+        #expect(decoded.testProof == nil)
     }
 
     @Test("wrong PSK is caught during validation")

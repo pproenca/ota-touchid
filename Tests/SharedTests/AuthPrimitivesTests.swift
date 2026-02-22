@@ -68,6 +68,52 @@ struct AuthProofTests {
         let nonce = Data(repeating: 0x42, count: OTA.nonceSize)
         #expect(AuthProof.verify(proofBase64: "", nonce: nonce, psk: key) == false)
     }
+
+    @Test("test-mode server proof verifies with matching nonce and cert fingerprint")
+    func testModeServerProofRoundTrip() {
+        let key = SymmetricKey(size: .bits256)
+        let nonce = Data(repeating: 0xAB, count: OTA.nonceSize)
+        let certFP = Data(repeating: 0xCD, count: 32)
+        let proof = AuthProof.computeTestServerProof(
+            psk: key,
+            nonce: nonce,
+            certFingerprint: certFP
+        )
+        let proofBase64 = proof.base64EncodedString()
+        #expect(AuthProof.verifyTestServerProof(
+            proofBase64: proofBase64,
+            psk: key,
+            nonce: nonce,
+            certFingerprint: certFP
+        ))
+    }
+
+    @Test("test-mode server proof rejects mismatched nonce or cert fingerprint")
+    func testModeServerProofRejectsMismatch() {
+        let key = SymmetricKey(size: .bits256)
+        let nonce = Data(repeating: 0x01, count: OTA.nonceSize)
+        let certFP = Data(repeating: 0x02, count: 32)
+        let badNonce = Data(repeating: 0x03, count: OTA.nonceSize)
+        let badCertFP = Data(repeating: 0x04, count: 32)
+        let proofBase64 = AuthProof.computeTestServerProof(
+            psk: key,
+            nonce: nonce,
+            certFingerprint: certFP
+        ).base64EncodedString()
+
+        #expect(AuthProof.verifyTestServerProof(
+            proofBase64: proofBase64,
+            psk: key,
+            nonce: badNonce,
+            certFingerprint: certFP
+        ) == false)
+        #expect(AuthProof.verifyTestServerProof(
+            proofBase64: proofBase64,
+            psk: key,
+            nonce: nonce,
+            certFingerprint: badCertFP
+        ) == false)
+    }
 }
 
 @Suite("Source rate limiter")

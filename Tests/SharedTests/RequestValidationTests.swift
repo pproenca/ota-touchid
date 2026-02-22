@@ -46,11 +46,13 @@ struct RequestValidationTests {
 
     @Test("valid test request returns .test")
     func validTestRequest() throws {
-        let payload = try makePayload(mode: "test")
+        let nonce = Data(repeating: 0xAB, count: OTA.nonceSize)
+        let payload = try makePayload(nonce: nonce, mode: "test")
         let limiter = SourceRateLimiter()
         let result = try validateAuthRequest(payload: payload, psk: psk, rateLimiter: limiter, source: "10.0.0.1:5000")
 
-        if case .test(_, let src) = result {
+        if case .test(let validatedNonce, _, let src) = result {
+            #expect(validatedNonce == nonce)
             #expect(src == "10.0.0.1:5000")
         } else {
             Issue.record("Expected .test, got \(result)")

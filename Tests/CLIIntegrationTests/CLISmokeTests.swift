@@ -52,6 +52,21 @@ struct CLISmokeTests {
         #expect(result.stderr.contains("Usage: ota-touchid pair"))
     }
 
+    @Test("pair command can read PSK from stdin")
+    func pairReadsFromStdin() throws {
+        let psk = Data(repeating: 0x11, count: 32).base64EncodedString()
+        let result = try runCLI(["pair", "--stdin"], stdin: "\(psk)\n")
+        #expect(result.status == 0)
+        #expect(result.stdout.contains("PSK saved"))
+    }
+
+    @Test("trust command rejects invalid public key")
+    func trustRejectsInvalidKey() throws {
+        let result = try runCLI(["trust", "not-base64"])
+        #expect(result.status == 1)
+        #expect(result.stderr.contains("invalid base64 public key"))
+    }
+
     @Test("status runs without crashing on fresh home dir")
     func statusOnFreshHome() throws {
         let result = try runCLI(["status"])
@@ -85,6 +100,8 @@ struct CLISmokeTests {
     func helpShowsAllCommands() throws {
         let result = try runCLI(["help"])
         #expect(result.stdout.contains("setup"))
+        #expect(result.stdout.contains("pair"))
+        #expect(result.stdout.contains("trust"))
         #expect(result.stdout.contains("test"))
         #expect(result.stdout.contains("auth"))
         #expect(result.stdout.contains("status"))
@@ -112,7 +129,7 @@ private struct CLIResult {
     let stderr: String
 }
 
-private func runCLI(_ args: [String]) throws -> CLIResult {
+private func runCLI(_ args: [String], stdin: String? = nil) throws -> CLIResult {
     let fm = FileManager.default
     let repoRoot = workspaceRoot()
     let executable = try findExecutable(in: repoRoot)
@@ -133,7 +150,17 @@ private func runCLI(_ args: [String]) throws -> CLIResult {
     process.environment = env
     process.standardOutput = outPipe
     process.standardError = errPipe
+
+    let inPipe = Pipe()
+    if stdin != nil {
+        process.standardInput = inPipe
+    }
+
     try process.run()
+    if let stdin {
+        inPipe.fileHandleForWriting.write(Data(stdin.utf8))
+        try? inPipe.fileHandleForWriting.close()
+    }
     process.waitUntilExit()
 
     let stdout = String(data: outPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""

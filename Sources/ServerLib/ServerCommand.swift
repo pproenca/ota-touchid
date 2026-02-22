@@ -333,10 +333,15 @@ private final class Server: @unchecked Sendable {
         }
 
         switch validated {
-        case .test(let hostname, _):
+        case .test(let nonce, let hostname, _):
             log("[\(source)] test request (client hostname: \(hostname)) — OK")
             auditLog("TEST_OK source=\(source) hostname=\(hostname)")
-            reply(.init(approved: true), on: conn)
+            let testProof = AuthProof.computeTestServerProof(
+                psk: psk,
+                nonce: nonce,
+                certFingerprint: certFingerprint
+            )
+            reply(.init(approved: true, testProof: testProof), on: conn)
 
         case .auth(let nonce, let hostname, let hasStoredKey, _):
             let displayReason = "OTA Touch ID request from \(source)"

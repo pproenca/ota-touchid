@@ -8,7 +8,7 @@ import Shared
 
 public enum ClientCommand {
     /// Authenticate via discovery or direct connection. Calls exit(0/1).
-    public static func auth(reason: String, host: String?, port: UInt16?) -> Never {
+    public static func auth(reason: String, host: String?, port: UInt16?, allowTOFU: Bool = false) -> Never {
         Task {
             do {
                 let endpoint: NWEndpoint
@@ -23,12 +23,22 @@ public enum ClientCommand {
                     fputs("Found server: \(endpoint)\n", stderr)
                 }
 
-                let approved = try await requestAuth(endpoint: endpoint, reason: reason)
+                let approved = try await requestAuth(
+                    endpoint: endpoint,
+                    reason: reason,
+                    allowTOFU: allowTOFU
+                )
                 exit(approved ? 0 : 1)
             } catch OTAError.authenticationFailed {
                 fputs(
                     "Error: No PSK configured. Run 'ota-touchid setup' first.\n",
                     stderr)
+                exit(1)
+            } catch OTAError.serverKeyNotTrusted {
+                fputs(
+                    "Error: No trusted server key configured. Run 'ota-touchid setup --client' or 'ota-touchid trust <server-public-key-base64>'.\n",
+                    stderr
+                )
                 exit(1)
             } catch {
                 fputs("Error: \(error.localizedDescription)\n", stderr)
@@ -117,6 +127,11 @@ public enum ClientCommand {
         {
             try trustKey(base64: pubKeyBase64)
             fputs("Server public key imported from iCloud Keychain (TOFU skipped).\n", stderr)
+        } else {
+            fputs(
+                "Warning: No server public key found in iCloud Keychain. Run 'ota-touchid trust <server-public-key-base64>' before auth.\n",
+                stderr
+            )
         }
     }
 
@@ -245,7 +260,7 @@ private func confirmTOFU(fingerprint: String) -> Bool {
         \n*** First connection to this server ***
         WARNING: Verify this fingerprint matches the server's output.
         An attacker on the local network could be impersonating the server.
-        For high-security environments, use --setup with the server's public key instead.
+        Preferred: pin the server key first with 'ota-touchid trust <server-public-key-base64>'.
 
         Server key fingerprint: \(fingerprint)
         Trust this key? [y/N] \u{0}
@@ -256,7 +271,7 @@ private func confirmTOFU(fingerprint: String) -> Bool {
 
 // MARK: - Auth Flow
 
-private func requestAuth(endpoint: NWEndpoint, reason: String) async throws -> Bool {
+private func requestAuth(endpoint: NWEndpoint, reason: String, allowTOFU: Bool) async throws -> Bool {
     // [C2] PSK is required for client authentication
     guard let psk = try loadPSK() else {
         throw OTAError.authenticationFailed
@@ -314,7 +329,11 @@ private func requestAuth(endpoint: NWEndpoint, reason: String) async throws -> B
         return true
     }
 
-    // TOFU: trust on first use — verify signature, then ask user
+    guard allowTOFU else {
+        throw OTAError.serverKeyNotTrusted
+    }
+
+    // TOFU: trust on first use (explicitly enabled via --allow-tofu).
     guard let pubBase64 = response.publicKey,
         let pubRaw = Data(base64Encoded: pubBase64)
     else {
@@ -368,6 +387,20 @@ private func requestTest(endpoint: NWEndpoint) async throws -> Bool {
 
     if !response.approved {
         fputs("Server: \(response.error ?? "unknown error")\n", stderr)
+        return false
     }
-    return response.approved
+
+    guard let certFP = peerInfo.certFingerprint else {
+        throw OTAError.testProofVerificationFailed
+    }
+    let verified = AuthProof.verifyTestServerProof(
+        proofBase64: response.testProof,
+        psk: psk,
+        nonce: nonce,
+        certFingerprint: certFP
+    )
+    if !verified {
+        throw OTAError.testProofVerificationFailed
+    }
+    return true
 }

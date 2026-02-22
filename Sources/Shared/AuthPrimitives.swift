@@ -4,6 +4,8 @@ import Foundation
 // MARK: - PSK Proof (HMAC-SHA256)
 
 public enum AuthProof {
+    private static let testProofContext = Data("ota-touchid:test-proof:v1".utf8)
+
     public static func compute(psk: SymmetricKey, nonce: Data) -> Data {
         let mac = HMAC<SHA256>.authenticationCode(for: nonce, using: psk)
         return Data(mac)
@@ -12,6 +14,27 @@ public enum AuthProof {
     public static func verify(proofBase64: String?, nonce: Data, psk: SymmetricKey) -> Bool {
         guard let proofBase64, let proofData = Data(base64Encoded: proofBase64) else { return false }
         return constantTimeEqual(proofData, compute(psk: psk, nonce: nonce))
+    }
+
+    /// Server-to-client proof used for `test` mode.
+    /// Binds to the same nonce and negotiated TLS peer certificate fingerprint.
+    public static func computeTestServerProof(
+        psk: SymmetricKey, nonce: Data, certFingerprint: Data
+    ) -> Data {
+        let payload = testProofContext + nonce + certFingerprint
+        let mac = HMAC<SHA256>.authenticationCode(for: payload, using: psk)
+        return Data(mac)
+    }
+
+    public static func verifyTestServerProof(
+        proofBase64: String?,
+        psk: SymmetricKey,
+        nonce: Data,
+        certFingerprint: Data
+    ) -> Bool {
+        guard let proofBase64, let proofData = Data(base64Encoded: proofBase64) else { return false }
+        let expected = computeTestServerProof(psk: psk, nonce: nonce, certFingerprint: certFingerprint)
+        return constantTimeEqual(proofData, expected)
     }
 
     private static func constantTimeEqual(_ lhs: Data, _ rhs: Data) -> Bool {

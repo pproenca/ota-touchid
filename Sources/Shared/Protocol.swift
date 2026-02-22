@@ -30,6 +30,8 @@ public enum OTAError: Error, LocalizedError, Sendable {
     case timeout
     case frameTooLarge(Int)
     case signatureVerificationFailed
+    case testProofVerificationFailed
+    case serverKeyNotTrusted
     case invalidPort(String)
     case authenticationFailed
 
@@ -51,6 +53,10 @@ public enum OTAError: Error, LocalizedError, Sendable {
             "Frame too large: \(n) bytes (max \(OTA.maxFrameSize))"
         case .signatureVerificationFailed:
             "Signature verification failed"
+        case .testProofVerificationFailed:
+            "Server test proof verification failed"
+        case .serverKeyNotTrusted:
+            "No trusted server key configured"
         case .invalidPort(let v):
             "Invalid port: \(v)"
         case .authenticationFailed:
@@ -108,18 +114,21 @@ public struct AuthResponse: Codable, Sendable {
     public let approved: Bool
     public let signature: String?   // base64
     public let publicKey: String?   // base64 (only sent for TOFU when client lacks key)
+    public let testProof: String?   // base64 HMAC(PSK, context || nonce || tlsCertFingerprint)
     public let error: String?
 
     public init(
         approved: Bool,
         signature: Data? = nil,
         publicKey: Data? = nil,
+        testProof: Data? = nil,
         error: String? = nil
     ) {
         self.version = OTA.protocolVersion
         self.approved = approved
         self.signature = signature?.base64EncodedString()
         self.publicKey = publicKey?.base64EncodedString()
+        self.testProof = testProof?.base64EncodedString()
         self.error = error
     }
 }

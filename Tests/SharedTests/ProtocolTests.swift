@@ -57,6 +57,7 @@ struct FrameTests {
         #expect(decoded.approved == true)
         #expect(Data(base64Encoded: decoded.signature!) == sig)
         #expect(Data(base64Encoded: decoded.publicKey!) == pub)
+        #expect(decoded.testProof == nil)
         #expect(decoded.version == OTA.protocolVersion)
         #expect(length == payload.count)
     }
@@ -98,6 +99,7 @@ struct FrameTests {
         #expect(decoded.approved == false)
         #expect(decoded.signature == nil)
         #expect(decoded.publicKey == nil)
+        #expect(decoded.testProof == nil)
         #expect(decoded.error == "biometry cancelled")
         #expect(decoded.version == OTA.protocolVersion)
     }
@@ -113,6 +115,7 @@ struct FrameTests {
         #expect(decoded.approved == true)
         #expect(decoded.publicKey == nil)
         #expect(decoded.signature != nil)
+        #expect(decoded.testProof == nil)
     }
 
     @Test("Round-trip AuthRequest with test mode")
@@ -233,6 +236,8 @@ struct ErrorTests {
             .timeout,
             .frameTooLarge(999),
             .signatureVerificationFailed,
+            .testProofVerificationFailed,
+            .serverKeyNotTrusted,
             .invalidPort("abc"),
             .authenticationFailed,
         ]
@@ -258,6 +263,8 @@ struct ErrorTests {
         #expect(OTAError.shortRead.clientDescription == "Request denied")
         #expect(OTAError.timeout.clientDescription == "Request denied")
         #expect(OTAError.signatureVerificationFailed.clientDescription == "Request denied")
+        #expect(OTAError.testProofVerificationFailed.clientDescription == "Request denied")
+        #expect(OTAError.serverKeyNotTrusted.clientDescription == "Request denied")
         #expect(OTAError.invalidPort("abc").clientDescription == "Request denied")
     }
 
@@ -307,6 +314,7 @@ struct MessageTests {
         #expect(resp.approved == true)
         #expect(resp.signature == sig.base64EncodedString())
         #expect(resp.publicKey == pub.base64EncodedString())
+        #expect(resp.testProof == nil)
         #expect(resp.error == nil)
     }
 
@@ -316,6 +324,7 @@ struct MessageTests {
         #expect(resp.approved == false)
         #expect(resp.signature == nil)
         #expect(resp.publicKey == nil)
+        #expect(resp.testProof == nil)
         #expect(resp.error == "denied by user")
     }
 
@@ -325,6 +334,7 @@ struct MessageTests {
         #expect(resp.approved == true)
         #expect(resp.signature == nil)
         #expect(resp.publicKey == nil)
+        #expect(resp.testProof == nil)
         #expect(resp.error == nil)
     }
 }
