@@ -137,7 +137,21 @@ private func createEphemeralIdentity() throws -> (sec_identity_t, Data) {
 
 private enum SelfSignedCert {
     static func build(publicKeyX963: Data, signWith key: SecKey) throws -> Data {
-        let tbs = tbsCertificate(publicKeyX963: [UInt8](publicKeyX963))
+        var attemptedProfiles: [String] = []
+        for profile in CertProfile.compatibilityOrder {
+            let certDER = try build(publicKeyX963: publicKeyX963, signWith: key, profile: profile)
+            attemptedProfiles.append("\(profile.rawValue):\(certDER.count)")
+            if SecCertificateCreateWithData(nil, certDER as CFData) != nil {
+                return certDER
+            }
+        }
+        throw OTAError.keyGenerationFailed(
+            "invalid certificate DER profiles (\(attemptedProfiles.joined(separator: ", ")))"
+        )
+    }
+
+    static func build(publicKeyX963: Data, signWith key: SecKey, profile: CertProfile) throws -> Data {
+        let tbs = tbsCertificate(publicKeyX963: [UInt8](publicKeyX963), profile: profile)
         let tbsData = Data(DER.sequence(tbs))
 
         var cfError: Unmanaged<CFError>?
@@ -152,8 +166,10 @@ private enum SelfSignedCert {
         return build(tbsData: [UInt8](tbsData), signatureDER: [UInt8](sig))
     }
 
-    static func build(publicKeyX963: [UInt8], signatureDER: [UInt8]) -> Data {
-        let tbs = tbsCertificate(publicKeyX963: publicKeyX963)
+    static func build(
+        publicKeyX963: [UInt8], signatureDER: [UInt8], profile: CertProfile = .v3WithBasicConstraints
+    ) -> Data {
+        let tbs = tbsCertificate(publicKeyX963: publicKeyX963, profile: profile)
         let tbsData = DER.sequence(tbs)
         return build(tbsData: tbsData, signatureDER: signatureDER)
     }
@@ -169,10 +185,7 @@ private enum SelfSignedCert {
 
     // -- TBS (To-Be-Signed) Certificate --
 
-    private static func tbsCertificate(publicKeyX963: [UInt8]) -> [UInt8] {
-        // DER forbids encoding DEFAULT values, so explicit v1 (0) is non-canonical.
-        // Use explicit v3 (2) for broad compatibility with strict parsers.
-        let version = DER.contextTag(0, DER.integer([0x02]))  // [0] EXPLICIT v3
+    private static func tbsCertificate(publicKeyX963: [UInt8], profile: CertProfile) -> [UInt8] {
         let serial = DER.integer([0x01])
         let issuer = rdnSequence("OTA Touch ID")
         let validity = DER.sequence(
@@ -183,14 +196,24 @@ private enum SelfSignedCert {
                 DER.oid(OID.ecPublicKey) + DER.oid(OID.prime256v1)
             ) + DER.bitString(publicKeyX963)
         )
-        // v3 requires at least one extension (RFC 5280 §4.1.2.9).
-        let basicConstraints = DER.sequence(
-            DER.oid(OID.basicConstraints)
-                + DER.boolean(true)
-                + DER.octetString(DER.sequence([]))
-        )
-        let extensions = DER.contextTag(3, DER.sequence(basicConstraints))
-        return version + serial + ecdsaSHA256OID + issuer + validity + issuer + spki + extensions
+
+        let base = serial + ecdsaSHA256OID + issuer + validity + issuer + spki
+        switch profile {
+        case .v3WithBasicConstraints:
+            let version = DER.contextTag(0, DER.integer([0x02]))  // [0] EXPLICIT v3
+            let basicConstraints = DER.sequence(
+                DER.oid(OID.basicConstraints)
+                    + DER.octetString(DER.sequence([]))
+            )
+            let extensions = DER.contextTag(3, DER.sequence(basicConstraints))
+            return version + base + extensions
+        case .v1Explicit:
+            // Non-canonical but historically accepted by stricter parsers.
+            let version = DER.contextTag(0, DER.integer([0x00]))  // [0] EXPLICIT v1
+            return version + base
+        case .v1Implicit:
+            return base
+        }
     }
 
     private static func rdnSequence(_ cn: String) -> [UInt8] {
@@ -205,11 +228,37 @@ private enum SelfSignedCert {
     )
 }
 
+private enum CertProfile: String {
+    case v3WithBasicConstraints = "v3-basic"
+    case v1Explicit = "v1-explicit"
+    case v1Implicit = "v1-implicit"
+
+    static let compatibilityOrder: [CertProfile] = [
+        .v3WithBasicConstraints,
+        .v1Explicit,
+        .v1Implicit,
+    ]
+}
+
 /// Test seam for deterministic certificate-shape checks without keychain or Secure Enclave.
 func buildSelfSignedCertDERForTesting(publicKeyX963: Data) -> Data {
     // Minimal ASN.1 ECDSA-Sig-Value: SEQUENCE { INTEGER 1, INTEGER 1 }.
     let fakeSignatureDER: [UInt8] = [0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01]
-    return SelfSignedCert.build(publicKeyX963: [UInt8](publicKeyX963), signatureDER: fakeSignatureDER)
+    for profile in CertProfile.compatibilityOrder {
+        let certDER = SelfSignedCert.build(
+            publicKeyX963: [UInt8](publicKeyX963),
+            signatureDER: fakeSignatureDER,
+            profile: profile
+        )
+        if SecCertificateCreateWithData(nil, certDER as CFData) != nil {
+            return certDER
+        }
+    }
+    return SelfSignedCert.build(
+        publicKeyX963: [UInt8](publicKeyX963),
+        signatureDER: fakeSignatureDER,
+        profile: .v3WithBasicConstraints
+    )
 }
 
 // MARK: - ASN.1 DER Encoding
@@ -219,7 +268,6 @@ private enum DER {
     static func sequence(_ c: [UInt8]) -> [UInt8] { tlv(0x30, c) }
     static func set(_ c: [UInt8]) -> [UInt8] { tlv(0x31, c) }
     static func integer(_ b: [UInt8]) -> [UInt8] { tlv(0x02, b) }
-    static func boolean(_ v: Bool) -> [UInt8] { tlv(0x01, [v ? 0xFF : 0x00]) }
     static func bitString(_ b: [UInt8]) -> [UInt8] { tlv(0x03, [0x00] + b) }
     static func octetString(_ b: [UInt8]) -> [UInt8] { tlv(0x04, b) }
     static func oid(_ b: [UInt8]) -> [UInt8] { tlv(0x06, b) }
