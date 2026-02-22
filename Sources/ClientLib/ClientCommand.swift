@@ -4,6 +4,82 @@ import Network
 import Security
 import Shared
 
+// MARK: - Public API
+
+public enum ClientCommand {
+    /// Authenticate via discovery or direct connection. Calls exit(0/1).
+    public static func auth(reason: String, host: String?, port: UInt16?) -> Never {
+        Task {
+            do {
+                let endpoint: NWEndpoint
+                if let host, let port {
+                    endpoint = NWEndpoint.hostPort(
+                        host: NWEndpoint.Host(host),
+                        port: NWEndpoint.Port(rawValue: port)!
+                    )
+                } else {
+                    fputs("Discovering server via Bonjour...\n", stderr)
+                    endpoint = try await discover()
+                    fputs("Found server: \(endpoint)\n", stderr)
+                }
+
+                let approved = try await requestAuth(endpoint: endpoint, reason: reason)
+                exit(approved ? 0 : 1)
+            } catch OTAError.authenticationFailed {
+                fputs(
+                    "Error: No PSK configured. Run 'ota-touchid pair <psk>' with the PSK from the server.\n",
+                    stderr)
+                exit(1)
+            } catch {
+                fputs("Error: \(error.localizedDescription)\n", stderr)
+                exit(1)
+            }
+        }
+        dispatchMain()
+    }
+
+    /// Save a PSK on the client machine.
+    public static func pair(pskBase64: String) throws {
+        guard let raw = Data(base64Encoded: pskBase64), raw.count == 32 else {
+            throw OTAError.badRequest("invalid PSK (expected 32-byte base64)")
+        }
+        let fm = FileManager.default
+        try fm.createDirectory(at: OTA.configDir, withIntermediateDirectories: true)
+        let tmpFile = OTA.pskFile.deletingLastPathComponent()
+            .appendingPathComponent(UUID().uuidString)
+        fm.createFile(
+            atPath: tmpFile.path,
+            contents: pskBase64.data(using: .utf8),
+            attributes: [.posixPermissions: 0o600]
+        )
+        try fm.moveItem(at: tmpFile, to: OTA.pskFile)
+        print("PSK saved to \(OTA.pskFile.path)")
+    }
+
+    /// Manually trust a server public key.
+    public static func trustKey(base64: String) throws {
+        try storePublicKey(base64)
+        print("Server public key stored.")
+    }
+
+    /// Show stored server key & PSK status.
+    public static func status() {
+        do {
+            if let key = try loadPublicKey() {
+                let fp = keyFingerprint(key.rawRepresentation)
+                print("Trusted server key: \(key.rawRepresentation.base64EncodedString())")
+                print("Fingerprint: \(fp)")
+            } else {
+                print("No trusted server key. Will use TOFU on first connection.")
+            }
+        } catch {
+            print("Error reading server key: \(error.localizedDescription)")
+        }
+        let hasPSK = (try? loadPSK()) != nil
+        print("PSK: \(hasPSK ? "configured" : "NOT configured (required)")")
+    }
+}
+
 // MARK: - Key Storage
 
 private let pubKeyFile = OTA.configDir.appendingPathComponent("server.pub")
@@ -188,130 +264,4 @@ private func requestAuth(endpoint: NWEndpoint, reason: String) async throws -> B
     try storePublicKey(pubBase64)
     fputs("Server key trusted and stored.\n", stderr)
     return true
-}
-
-// MARK: - CLI
-
-private func parseArgs() throws -> (action: Action, reason: String) {
-    let args = CommandLine.arguments
-
-    if args.contains("--help") || args.contains("-h") {
-        return (.help, "")
-    }
-
-    if args.contains("--status") {
-        return (.status, "")
-    }
-
-    if let idx = args.firstIndex(of: "--setup"), idx + 1 < args.count {
-        return (.setup(args[idx + 1]), "")
-    }
-
-    let reason: String
-    if let idx = args.firstIndex(of: "--reason"), idx + 1 < args.count {
-        reason = args[idx + 1]
-    } else {
-        reason = "authentication"
-    }
-
-    if let hostIdx = args.firstIndex(of: "--host"), hostIdx + 1 < args.count {
-        let host = args[hostIdx + 1]
-        guard let portIdx = args.firstIndex(of: "--port"), portIdx + 1 < args.count else {
-            throw OTAError.badRequest("--host requires --port")
-        }
-        guard let port = UInt16(args[portIdx + 1]) else {
-            throw OTAError.invalidPort(args[portIdx + 1])
-        }
-        let endpoint = NWEndpoint.hostPort(
-            host: NWEndpoint.Host(host),
-            port: NWEndpoint.Port(rawValue: port)!  // UInt16 always valid
-        )
-        return (.direct(endpoint), reason)
-    }
-
-    return (.discover, reason)
-}
-
-private enum Action {
-    case help
-    case status
-    case setup(String)
-    case discover
-    case direct(NWEndpoint)
-}
-
-private let helpText = """
-    OTA Touch ID Client
-
-    Usage:
-      ota-client                              Authenticate via Bonjour discovery
-      ota-client --reason "sudo"              Custom reason shown in Touch ID prompt
-      ota-client --host <ip> --port <port>    Direct connection (skip Bonjour)
-      ota-client --setup <base64-public-key>  Manually trust a server key
-      ota-client --status                     Show stored server key & PSK status
-
-    Setup:
-      Copy the PSK from the server output to ~/.config/ota-touchid/psk
-
-    Exit codes:
-      0  Approved (Touch ID succeeded, signature valid)
-      1  Denied or error
-    """
-
-// MARK: - Entry Point
-
-do {
-    let (action, reason) = try parseArgs()
-
-    switch action {
-    case .help:
-        print(helpText)
-        exit(0)
-
-    case .status:
-        if let key = try loadPublicKey() {
-            let fp = keyFingerprint(key.rawRepresentation)
-            print("Trusted server key: \(key.rawRepresentation.base64EncodedString())")
-            print("Fingerprint: \(fp)")
-        } else {
-            print("No trusted server key. Will use TOFU on first connection.")
-        }
-        let hasPSK = (try? loadPSK()) != nil
-        print("PSK: \(hasPSK ? "configured" : "NOT configured (required)")")
-        exit(0)
-
-    case .setup(let base64):
-        try storePublicKey(base64)
-        print("Server public key stored.")
-        exit(0)
-
-    case .discover, .direct:
-        Task {
-            do {
-                let endpoint: NWEndpoint
-                if case .direct(let ep) = action {
-                    endpoint = ep
-                } else {
-                    fputs("Discovering server via Bonjour...\n", stderr)
-                    endpoint = try await discover()
-                    fputs("Found server: \(endpoint)\n", stderr)
-                }
-
-                let approved = try await requestAuth(endpoint: endpoint, reason: reason)
-                exit(approved ? 0 : 1)
-            } catch OTAError.authenticationFailed {
-                fputs(
-                    "Error: No PSK configured. Copy the PSK from the server to ~/.config/ota-touchid/psk\n",
-                    stderr)
-                exit(1)
-            } catch {
-                fputs("Error: \(error.localizedDescription)\n", stderr)
-                exit(1)
-            }
-        }
-        dispatchMain()
-    }
-} catch {
-    fputs("Error: \(error.localizedDescription)\n", stderr)
-    exit(1)
 }

@@ -5,8 +5,7 @@ let package = Package(
     name: "OTATouchID",
     platforms: [.macOS(.v14)],
     products: [
-        .executable(name: "ota-server", targets: ["Server"]),
-        .executable(name: "ota-client", targets: ["Client"]),
+        .executable(name: "ota-touchid", targets: ["CLI"]),
     ],
     targets: [
         .target(
@@ -15,17 +14,25 @@ let package = Package(
                 .linkedFramework("Security"),
             ]
         ),
-        .executableTarget(
-            name: "Server",
+        .target(
+            name: "ServerLib",
             dependencies: ["Shared"],
             linkerSettings: [
                 .linkedFramework("LocalAuthentication"),
                 .linkedFramework("Security"),
             ]
         ),
-        .executableTarget(
-            name: "Client",
+        .target(
+            name: "ClientLib",
             dependencies: ["Shared"]
+        ),
+        .executableTarget(
+            name: "CLI",
+            dependencies: ["ServerLib", "ClientLib", "Shared"],
+            linkerSettings: [
+                .linkedFramework("LocalAuthentication"),
+                .linkedFramework("Security"),
+            ]
         ),
         .testTarget(
             name: "SharedTests",

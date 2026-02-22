@@ -5,6 +5,52 @@ import Network
 import Security
 import Shared
 
+// MARK: - Public API
+
+public enum ServerCommand {
+    /// Run the server foreground (blocks forever via dispatchMain).
+    public static func run() -> Never {
+        do {
+            let key = try loadOrCreateKey()
+            let psk = try loadOrCreatePSK()
+            let pubRaw = key.publicKey.rawRepresentation
+
+            // [C1] TLS is mandatory — never fall back to plaintext TCP.
+            let (params, certFingerprint) = try TLSConfig.serverParameters()
+            fputs("TLS enabled.\n", stderr)
+
+            let pskBase64 = psk.withUnsafeBytes { Data($0) }.base64EncodedString()
+
+            print("OTA Touch ID Server")
+            print(String(repeating: "\u{2500}", count: 40))
+            print("Public key: \(pubRaw.base64EncodedString())")
+            print("PSK:        \(pskBase64)")
+            print("  Pair a client: ota-touchid pair \(pskBase64)\n")
+
+            let server = try Server(
+                keyBlob: key.dataRepresentation,
+                publicKeyRaw: pubRaw,
+                psk: psk,
+                certFingerprint: certFingerprint,
+                params: params
+            )
+            server.start()
+
+            dispatchMain()
+        } catch {
+            fputs("Fatal: \(error.localizedDescription)\n", stderr)
+            exit(1)
+        }
+    }
+
+    /// Generate keys + PSK without starting the listener. Returns PSK base64.
+    public static func generateConfig() throws -> String {
+        _ = try loadOrCreateKey()
+        let psk = try loadOrCreatePSK()
+        return psk.withUnsafeBytes { Data($0) }.base64EncodedString()
+    }
+}
+
 // MARK: - Key Management
 
 private let keyFile = OTA.configDir.appendingPathComponent("server.key")
@@ -301,38 +347,4 @@ private final class Server: @unchecked Sendable {
             conn.cancel()
         }
     }
-}
-
-// MARK: - Entry Point
-
-do {
-    let key = try loadOrCreateKey()
-    let psk = try loadOrCreatePSK()
-    let pubRaw = key.publicKey.rawRepresentation
-
-    // [C1] TLS is mandatory — never fall back to plaintext TCP.
-    let (params, certFingerprint) = try TLSConfig.serverParameters()
-    fputs("TLS enabled.\n", stderr)
-
-    let pskBase64 = psk.withUnsafeBytes { Data($0) }.base64EncodedString()
-
-    print("OTA Touch ID Server")
-    print(String(repeating: "\u{2500}", count: 40))
-    print("Public key: \(pubRaw.base64EncodedString())")
-    print("PSK:        \(pskBase64)")
-    print("  Copy the PSK to the client: ~/.config/ota-touchid/psk\n")
-
-    let server = try Server(
-        keyBlob: key.dataRepresentation,
-        publicKeyRaw: pubRaw,
-        psk: psk,
-        certFingerprint: certFingerprint,
-        params: params
-    )
-    server.start()
-
-    dispatchMain()
-} catch {
-    fputs("Fatal: \(error.localizedDescription)\n", stderr)
-    exit(1)
 }
