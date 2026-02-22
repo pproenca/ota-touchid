@@ -23,6 +23,8 @@ struct FrameTests {
         #expect(decoded.version == OTA.protocolVersion)
         #expect(decoded.hasStoredKey == false)
         #expect(decoded.requestMAC == nil)
+        #expect(decoded.clientSignature == nil)
+        #expect(decoded.clientPublicKey == nil)
         #expect(decoded.clientProof == nil)
         #expect(decoded.mode == "auth")
     }
@@ -31,12 +33,16 @@ struct FrameTests {
     func roundTripAuthRequestFull() throws {
         let nonce = Data(repeating: 0xAB, count: OTA.nonceSize)
         let proof = Data(repeating: 0x01, count: 32)
+        let clientSig = Data(repeating: 0x10, count: 64)
+        let clientKey = Data(repeating: 0x11, count: 65)
         let original = AuthRequest(
             mode: "auth",
             nonce: nonce,
             reason: "sudo",
             hasStoredKey: true,
-            requestMAC: proof
+            requestMAC: proof,
+            clientSignature: clientSig,
+            clientPublicKey: clientKey
         )
         let encoded = try Frame.encode(original)
         let payload = encoded.suffix(from: 4)
@@ -45,6 +51,8 @@ struct FrameTests {
         #expect(decoded.hasStoredKey == true)
         #expect(decoded.requestMAC != nil)
         #expect(Data(base64Encoded: decoded.requestMAC!) == proof)
+        #expect(Data(base64Encoded: decoded.clientSignature!) == clientSig)
+        #expect(Data(base64Encoded: decoded.clientPublicKey!) == clientKey)
         #expect(decoded.clientProof == nil)
         #expect(decoded.version == OTA.protocolVersion)
         #expect(decoded.mode == "auth")
@@ -153,6 +161,8 @@ struct FrameTests {
         #expect(decoded.reason == "test")
         #expect(decoded.hasStoredKey == true)
         #expect(decoded.requestMAC != nil)
+        #expect(decoded.clientSignature == nil)
+        #expect(decoded.clientPublicKey == nil)
     }
 
     @Test("Backward compat: decode JSON without mode key yields nil")
@@ -260,6 +270,7 @@ struct ErrorTests {
             .responseVerificationFailed,
             .testProofVerificationFailed,
             .serverKeyNotTrusted,
+            .clientNotEnrolled,
             .invalidPort("abc"),
             .authenticationFailed,
         ]
@@ -279,6 +290,7 @@ struct ErrorTests {
         #expect(OTAError.badRequest("invalid nonce").clientDescription == "Bad request")
         #expect(OTAError.frameTooLarge(999_999).clientDescription == "Request too large")
         #expect(OTAError.authenticationFailed.clientDescription == "Authentication failed")
+        #expect(OTAError.clientNotEnrolled.clientDescription == "Client not enrolled")
 
         // Everything else → "Request denied"
         #expect(OTAError.serverNotFound.clientDescription == "Request denied")
@@ -315,6 +327,8 @@ struct MessageTests {
         #expect(req.hostname == ProcessInfo.processInfo.hostName)
         #expect(req.hasStoredKey == false)
         #expect(req.requestMAC == nil)
+        #expect(req.clientSignature == nil)
+        #expect(req.clientPublicKey == nil)
         #expect(req.clientProof == nil)
         #expect(req.mode == "auth")
     }
@@ -323,15 +337,21 @@ struct MessageTests {
     func authRequestFull() {
         let nonce = Data(repeating: 0xAA, count: 32)
         let proof = Data(repeating: 0xBB, count: 32)
+        let clientSig = Data(repeating: 0xCC, count: 64)
+        let clientKey = Data(repeating: 0xDD, count: 65)
         let req = AuthRequest(
             mode: "test",
             nonce: nonce,
             reason: "test",
             hasStoredKey: true,
-            requestMAC: proof
+            requestMAC: proof,
+            clientSignature: clientSig,
+            clientPublicKey: clientKey
         )
         #expect(req.hasStoredKey == true)
         #expect(req.requestMAC == proof.base64EncodedString())
+        #expect(req.clientSignature == clientSig.base64EncodedString())
+        #expect(req.clientPublicKey == clientKey.base64EncodedString())
         #expect(req.clientProof == nil)
         #expect(req.mode == "test")
     }

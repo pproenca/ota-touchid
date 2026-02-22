@@ -13,7 +13,8 @@ struct RequestValidationTests {
         reason: String = "test",
         hasStoredKey: Bool = false,
         psk: SymmetricKey? = nil,
-        mode: String? = nil
+        mode: String? = nil,
+        includePublicKey: Bool = false
     ) throws -> Data {
         let key = psk ?? self.psk
         let normalizedMode = mode ?? "auth"
@@ -30,7 +31,9 @@ struct RequestValidationTests {
             nonce: nonce,
             reason: reason,
             hasStoredKey: hasStoredKey,
-            requestMAC: proof
+            requestMAC: proof,
+            clientSignature: Data(repeating: 0x11, count: 64),
+            clientPublicKey: includePublicKey ? Data(repeating: 0x22, count: 65) : nil
         )
         let frame = try Frame.encode(req)
         return Data(frame.suffix(from: 4))
@@ -43,9 +46,8 @@ struct RequestValidationTests {
         let limiter = SourceRateLimiter()
         let result = try validateAuthRequest(payload: payload, psk: psk, rateLimiter: limiter, source: "10.0.0.1:5000")
 
-        if case .auth(let n, _, _, let hasKey, let src) = result {
+        if case .auth(let n, _, _, _, _, let src) = result {
             #expect(n == nonce)
-            #expect(hasKey == false)
             #expect(src == "10.0.0.1:5000")
         } else {
             Issue.record("Expected .auth, got \(result)")
@@ -64,6 +66,28 @@ struct RequestValidationTests {
             #expect(src == "10.0.0.1:5000")
         } else {
             Issue.record("Expected .test, got \(result)")
+        }
+    }
+
+    @Test("valid enroll request returns .enroll")
+    func validEnrollRequest() throws {
+        let nonce = Data(repeating: 0xAB, count: OTA.nonceSize)
+        let payload = try makePayload(
+            nonce: nonce,
+            reason: "enroll",
+            mode: "enroll",
+            includePublicKey: true
+        )
+        let limiter = SourceRateLimiter()
+        let result = try validateAuthRequest(payload: payload, psk: psk, rateLimiter: limiter, source: "10.0.0.1:5000")
+
+        if case .enroll(let validatedNonce, _, let key, let sig, let src) = result {
+            #expect(validatedNonce == nonce)
+            #expect(key.count == 65)
+            #expect(sig.count == 64)
+            #expect(src == "10.0.0.1:5000")
+        } else {
+            Issue.record("Expected .enroll, got \(result)")
         }
     }
 
@@ -132,14 +156,14 @@ struct RequestValidationTests {
         }
     }
 
-    @Test("hasStoredKey is preserved in validated result")
-    func hasStoredKeyPreserved() throws {
-        let payload = try makePayload(hasStoredKey: true)
+    @Test("client public key is preserved for auth requests")
+    func authPublicKeyPreserved() throws {
+        let payload = try makePayload(hasStoredKey: true, includePublicKey: true)
         let limiter = SourceRateLimiter()
         let result = try validateAuthRequest(payload: payload, psk: psk, rateLimiter: limiter, source: "x")
 
-        if case .auth(_, _, _, let hasKey, _) = result {
-            #expect(hasKey == true)
+        if case .auth(_, _, _, let clientPublicKey, _, _) = result {
+            #expect(clientPublicKey?.count == 65)
         } else {
             Issue.record("Expected .auth")
         }

@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import LocalAuthentication
 import Network
 import Security
 import Shared
@@ -28,6 +29,38 @@ public enum ClientCommand {
             } catch OTAError.serverKeyNotTrusted {
                 fputs(
                     "Error: No trusted server key configured. Run 'ota-touchid setup --client' or 'ota-touchid trust <server-public-key-base64>'.\n",
+                    stderr
+                )
+                exit(1)
+            } catch OTAError.clientNotEnrolled {
+                fputs(
+                    "Error: Client key is not enrolled on server. Run 'ota-touchid enroll' first.\n",
+                    stderr
+                )
+                exit(1)
+            } catch {
+                fputs("Error: \(error.localizedDescription)\n", stderr)
+                exit(1)
+            }
+        }
+        dispatchMain()
+    }
+
+    /// Register this client key with the server (Touch ID prompt on this client).
+    public static func enroll(host: String?, port: UInt16?, allowTOFU: Bool = false) -> Never {
+        Task {
+            do {
+                let endpoint = try await resolveEndpoint(host: host, port: port)
+                try await requestEnroll(endpoint: endpoint, allowTOFU: allowTOFU)
+                saveEndpointHint(from: endpoint)
+                print("Client key enrolled on server.")
+                exit(0)
+            } catch OTAError.authenticationFailed {
+                fputs("Error: No PSK configured. Run 'ota-touchid setup' first.\n", stderr)
+                exit(1)
+            } catch OTAError.serverKeyNotTrusted {
+                fputs(
+                    "Error: No trusted server key configured. Run 'ota-touchid trust <server-public-key-base64>' first.\n",
                     stderr
                 )
                 exit(1)
@@ -97,6 +130,16 @@ public enum ClientCommand {
         } catch {
             print("Error reading server key: \(error.localizedDescription)")
         }
+        do {
+            if let clientKey = try loadClientSigningKey() {
+                let fp = keyFingerprint(clientKey.publicKey.rawRepresentation)
+                print("Client key: present (\(fp))")
+            } else {
+                print("Client key: not configured")
+            }
+        } catch {
+            print("Client key: error (\(error.localizedDescription))")
+        }
         if let hint = loadEndpointHint() {
             print("Endpoint hint: \(hint.host):\(hint.port)")
         } else {
@@ -110,6 +153,7 @@ public enum ClientCommand {
     public static func setupClient(pskBase64: String?) throws {
         if let pskBase64, pskBase64.hasPrefix(PairingBundle.prefix) {
             try pairInput(pskBase64)
+            _ = try loadOrCreateClientSigningKey()
             return
         }
 
@@ -138,6 +182,7 @@ public enum ClientCommand {
         }
 
         try pairInput(psk!)
+        _ = try loadOrCreateClientSigningKey()
 
         // Try to get public key from iCloud Keychain (eliminates TOFU)
         if let pubKeyData = SyncedKeychain.read(account: .serverPublicKey),
@@ -182,7 +227,8 @@ public enum ClientCommand {
 
 // MARK: - Key Storage
 
-private let pubKeyFile = OTA.configDir.appendingPathComponent("server.pub")
+private let pubKeyFile = OTA.trustedServerKeyFile
+private let clientKeyFile = OTA.clientKeyFile
 
 private func storePublicKey(_ base64: String) throws {
     guard Data(base64Encoded: base64) != nil else {
@@ -209,6 +255,58 @@ private func loadPublicKey() throws -> P256.Signing.PublicKey? {
         throw OTAError.badRequest("stored public key is not valid base64")
     }
     return try P256.Signing.PublicKey(rawRepresentation: data)
+}
+
+private func loadClientSigningKey() throws -> SecureEnclave.P256.Signing.PrivateKey? {
+    guard FileManager.default.fileExists(atPath: clientKeyFile.path) else { return nil }
+    let blob = try Data(contentsOf: clientKeyFile)
+    return try SecureEnclave.P256.Signing.PrivateKey(dataRepresentation: blob)
+}
+
+private func loadOrCreateClientSigningKey() throws -> SecureEnclave.P256.Signing.PrivateKey {
+    if let key = try loadClientSigningKey() {
+        return key
+    }
+    guard SecureEnclave.isAvailable else {
+        throw OTAError.secureEnclaveUnavailable
+    }
+    var cfError: Unmanaged<CFError>?
+    guard let acl = SecAccessControlCreateWithFlags(
+        nil,
+        kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+        [.privateKeyUsage, .biometryCurrentSet],
+        &cfError
+    ) else {
+        throw cfError!.takeRetainedValue()
+    }
+    let key = try SecureEnclave.P256.Signing.PrivateKey(accessControl: acl)
+    let fm = FileManager.default
+    try fm.createDirectory(at: OTA.configDir, withIntermediateDirectories: true)
+    let tmpFile = clientKeyFile.deletingLastPathComponent()
+        .appendingPathComponent(UUID().uuidString)
+    fm.createFile(
+        atPath: tmpFile.path,
+        contents: key.dataRepresentation,
+        attributes: [.posixPermissions: 0o600]
+    )
+    try? fm.removeItem(at: clientKeyFile)
+    try fm.moveItem(at: tmpFile, to: clientKeyFile)
+    return key
+}
+
+private func signWithClientBiometry(payload: Data, reason: String) async throws -> Data {
+    let keyBlob = try loadOrCreateClientSigningKey().dataRepresentation
+    let context = LAContext()
+    try await context.evaluatePolicy(
+        .deviceOwnerAuthenticationWithBiometrics,
+        localizedReason: reason
+    )
+    let key = try SecureEnclave.P256.Signing.PrivateKey(
+        dataRepresentation: keyBlob,
+        authenticationContext: context
+    )
+    let signature = try key.signature(for: payload)
+    return signature.rawRepresentation
 }
 
 // MARK: - PSK [C2]
@@ -348,58 +446,68 @@ private func confirmTOFU(fingerprint: String) -> Bool {
 // MARK: - Auth Flow
 
 private func requestAuth(endpoint: NWEndpoint, reason: String, allowTOFU: Bool) async throws -> Bool {
-    // [C2] PSK is required for client authentication
     guard let psk = try loadPSK() else {
         throw OTAError.authenticationFailed
     }
     let mode = "auth"
     let nonceC = try randomNonce()
+    let hostname = ProcessInfo.processInfo.hostName
 
+    let peerInfo = TLSPeerInfo()
+    let conn = try await asyncConnect(to: endpoint, using: TLSConfig.clientParameters(peerInfo: peerInfo))
+    defer { conn.cancel() }
+    guard let certFP = peerInfo.certFingerprint else {
+        throw OTAError.responseVerificationFailed
+    }
+
+    let clientKey = try loadOrCreateClientSigningKey()
+    let clientPayload = AuthProof.clientSignaturePayload(
+        mode: mode,
+        nonce: nonceC,
+        reason: reason,
+        hostname: hostname,
+        certFingerprint: certFP
+    )
+    let clientSignature = try await signWithClientBiometry(
+        payload: clientPayload,
+        reason: "Authorize \(reason)"
+    )
     let hasStoredKey = (try? loadPublicKey()) != nil
     let requestMAC = AuthProof.computeRequestMAC(
         psk: psk,
         mode: mode,
         nonce: nonceC,
         reason: reason,
-        hostname: ProcessInfo.processInfo.hostName,
+        hostname: hostname,
         hasStoredKey: hasStoredKey
     )
-
     let request = AuthRequest(
         mode: mode,
         nonce: nonceC,
         reason: reason,
         hasStoredKey: hasStoredKey,
-        requestMAC: requestMAC
+        requestMAC: requestMAC,
+        clientSignature: clientSignature,
+        clientPublicKey: clientKey.publicKey.rawRepresentation
     )
     let frame = try Frame.encode(request)
-
-    // [M2/H2] Capture peer TLS cert fingerprint for channel binding
-    let peerInfo = TLSPeerInfo()
-    let conn = try await asyncConnect(to: endpoint, using: TLSConfig.clientParameters(peerInfo: peerInfo))
-    defer { conn.cancel() }
-
     try await asyncSend(frame, on: conn)
+
     let response: AuthResponse = try await asyncReadFrame(AuthResponse.self, on: conn)
-    guard let certFP = peerInfo.certFingerprint else {
+    guard response.mode == mode else {
         throw OTAError.responseVerificationFailed
     }
-    guard let nonceSBase64 = response.nonceS, let nonceS = Data(base64Encoded: nonceSBase64) else {
+    guard let nonceS = response.nonceS.flatMap({ Data(base64Encoded: $0) }) else {
         throw OTAError.responseVerificationFailed
     }
-    let responseMode = response.mode ?? mode
-    guard responseMode == mode else {
-        throw OTAError.responseVerificationFailed
-    }
-    let signatureData = response.signature.flatMap { Data(base64Encoded: $0) }
     let verifiedResponse = AuthProof.verifyResponseMAC(
         proofBase64: response.responseMAC,
         psk: psk,
-        mode: responseMode,
+        mode: mode,
         nonceC: nonceC,
         nonceS: nonceS,
         approved: response.approved,
-        signature: signatureData,
+        signature: response.signature.flatMap { Data(base64Encoded: $0) },
         error: response.error,
         certFingerprint: certFP
     )
@@ -408,53 +516,152 @@ private func requestAuth(endpoint: NWEndpoint, reason: String, allowTOFU: Bool) 
     }
 
     if !response.approved {
+        if response.error?.contains("Client not enrolled") == true {
+            throw OTAError.clientNotEnrolled
+        }
         fputs("Denied: \(response.error ?? "unknown")\n", stderr)
         return false
     }
-    guard let sigRaw = signatureData else {
+    try verifyServerIdentity(
+        response: response,
+        mode: mode,
+        nonceC: nonceC,
+        nonceS: nonceS,
+        reason: reason,
+        certFingerprint: certFP,
+        allowTOFU: allowTOFU
+    )
+    return true
+}
+
+private func requestEnroll(endpoint: NWEndpoint, allowTOFU: Bool) async throws {
+    guard let psk = try loadPSK() else {
+        throw OTAError.authenticationFailed
+    }
+    let mode = "enroll"
+    let reason = "enroll"
+    let nonceC = try randomNonce()
+    let hostname = ProcessInfo.processInfo.hostName
+
+    let peerInfo = TLSPeerInfo()
+    let conn = try await asyncConnect(to: endpoint, using: TLSConfig.clientParameters(peerInfo: peerInfo))
+    defer { conn.cancel() }
+    guard let certFP = peerInfo.certFingerprint else {
+        throw OTAError.responseVerificationFailed
+    }
+
+    let clientKey = try loadOrCreateClientSigningKey()
+    let clientPayload = AuthProof.clientSignaturePayload(
+        mode: mode,
+        nonce: nonceC,
+        reason: reason,
+        hostname: hostname,
+        certFingerprint: certFP
+    )
+    let clientSignature = try await signWithClientBiometry(
+        payload: clientPayload,
+        reason: "Enroll this Mac for OTA Touch ID"
+    )
+    let requestMAC = AuthProof.computeRequestMAC(
+        psk: psk,
+        mode: mode,
+        nonce: nonceC,
+        reason: reason,
+        hostname: hostname,
+        hasStoredKey: true
+    )
+    let request = AuthRequest(
+        mode: mode,
+        nonce: nonceC,
+        reason: reason,
+        hasStoredKey: true,
+        requestMAC: requestMAC,
+        clientSignature: clientSignature,
+        clientPublicKey: clientKey.publicKey.rawRepresentation
+    )
+    try await asyncSend(try Frame.encode(request), on: conn)
+
+    let response: AuthResponse = try await asyncReadFrame(AuthResponse.self, on: conn)
+    guard response.mode == mode else {
+        throw OTAError.responseVerificationFailed
+    }
+    guard let nonceS = response.nonceS.flatMap({ Data(base64Encoded: $0) }) else {
+        throw OTAError.responseVerificationFailed
+    }
+    guard AuthProof.verifyResponseMAC(
+        proofBase64: response.responseMAC,
+        psk: psk,
+        mode: mode,
+        nonceC: nonceC,
+        nonceS: nonceS,
+        approved: response.approved,
+        signature: response.signature.flatMap { Data(base64Encoded: $0) },
+        error: response.error,
+        certFingerprint: certFP
+    ) else {
+        throw OTAError.responseVerificationFailed
+    }
+    guard response.approved else {
+        throw OTAError.badRequest(response.error ?? "Enrollment denied")
+    }
+
+    try verifyServerIdentity(
+        response: response,
+        mode: mode,
+        nonceC: nonceC,
+        nonceS: nonceS,
+        reason: reason,
+        certFingerprint: certFP,
+        allowTOFU: allowTOFU
+    )
+}
+
+private func verifyServerIdentity(
+    response: AuthResponse,
+    mode: String,
+    nonceC: Data,
+    nonceS: Data,
+    reason: String,
+    certFingerprint: Data,
+    allowTOFU: Bool
+) throws {
+    guard let sigRaw = response.signature.flatMap({ Data(base64Encoded: $0) }) else {
         throw OTAError.signatureVerificationFailed
     }
     let signature = try P256.Signing.ECDSASignature(rawRepresentation: sigRaw)
-    let signedData = AuthProof.authSignaturePayload(
+    let signedData = AuthProof.serverSignaturePayload(
+        mode: mode,
         nonceC: nonceC,
         nonceS: nonceS,
         approved: true,
         reason: reason,
-        certFingerprint: certFP
+        certFingerprint: certFingerprint
     )
 
-    // Verify against stored key
     if let storedKey = try loadPublicKey() {
         guard storedKey.isValidSignature(signature, for: signedData) else {
             throw OTAError.signatureVerificationFailed
         }
-        return true
+        return
     }
 
     guard allowTOFU else {
         throw OTAError.serverKeyNotTrusted
     }
-
-    // TOFU: trust on first use (explicitly enabled via --allow-tofu).
     guard let pubBase64 = response.publicKey,
-        let pubRaw = Data(base64Encoded: pubBase64)
+          let pubRaw = Data(base64Encoded: pubBase64)
     else {
         throw OTAError.signatureVerificationFailed
     }
-
     let key = try P256.Signing.PublicKey(rawRepresentation: pubRaw)
     guard key.isValidSignature(signature, for: signedData) else {
         throw OTAError.signatureVerificationFailed
     }
-
     guard confirmTOFU(fingerprint: keyFingerprint(pubRaw)) else {
-        fputs("Connection aborted by user.\n", stderr)
-        return false
+        throw OTAError.badRequest("trust-on-first-use rejected")
     }
-
     try storePublicKey(pubBase64)
     fputs("Server key trusted and stored.\n", stderr)
-    return true
 }
 
 // MARK: - Test Flow (PSK-only, no Touch ID)

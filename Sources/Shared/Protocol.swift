@@ -19,6 +19,18 @@ public enum OTA {
         configDir.appendingPathComponent("psk")
     }
 
+    public static var clientKeyFile: URL {
+        configDir.appendingPathComponent("client.key")
+    }
+
+    public static var trustedServerKeyFile: URL {
+        configDir.appendingPathComponent("server.pub")
+    }
+
+    public static var trustedClientKeyFile: URL {
+        configDir.appendingPathComponent("client.pub")
+    }
+
     public static var endpointFile: URL {
         configDir.appendingPathComponent("server.endpoint.json")
     }
@@ -38,6 +50,7 @@ public enum OTAError: Error, LocalizedError, Sendable {
     case responseVerificationFailed
     case testProofVerificationFailed
     case serverKeyNotTrusted
+    case clientNotEnrolled
     case invalidPort(String)
     case authenticationFailed
 
@@ -65,6 +78,8 @@ public enum OTAError: Error, LocalizedError, Sendable {
             "Server test proof verification failed"
         case .serverKeyNotTrusted:
             "No trusted server key configured"
+        case .clientNotEnrolled:
+            "No trusted client key configured on server"
         case .invalidPort(let v):
             "Invalid port: \(v)"
         case .authenticationFailed:
@@ -83,6 +98,8 @@ public enum OTAError: Error, LocalizedError, Sendable {
             "Request too large"
         case .authenticationFailed:
             "Authentication failed"
+        case .clientNotEnrolled:
+            "Client not enrolled"
         default:
             "Request denied"
         }
@@ -93,12 +110,14 @@ public enum OTAError: Error, LocalizedError, Sendable {
 
 public struct AuthRequest: Codable, Sendable {
     public let version: Int
-    public let mode: String?          // "auth" / "test"
+    public let mode: String?          // "auth" / "test" / "enroll"
     public let nonce: String          // client nonce, base64
     public let reason: String
     public let hostname: String
     public let hasStoredKey: Bool     // tells server whether to include pubkey in response
     public let requestMAC: String?    // HMAC-SHA256 over request transcript, base64
+    public let clientSignature: String?  // base64 Secure Enclave signature from client
+    public let clientPublicKey: String?  // base64 rawRepresentation
     public let clientProof: String?   // legacy v1 compatibility field
 
     public init(
@@ -106,7 +125,9 @@ public struct AuthRequest: Codable, Sendable {
         nonce: Data,
         reason: String,
         hasStoredKey: Bool = false,
-        requestMAC: Data? = nil
+        requestMAC: Data? = nil,
+        clientSignature: Data? = nil,
+        clientPublicKey: Data? = nil
     ) {
         self.version = OTA.protocolVersion
         self.mode = mode
@@ -115,6 +136,8 @@ public struct AuthRequest: Codable, Sendable {
         self.hostname = ProcessInfo.processInfo.hostName
         self.hasStoredKey = hasStoredKey
         self.requestMAC = requestMAC?.base64EncodedString()
+        self.clientSignature = clientSignature?.base64EncodedString()
+        self.clientPublicKey = clientPublicKey?.base64EncodedString()
         self.clientProof = nil
     }
 }

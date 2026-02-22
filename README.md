@@ -1,6 +1,6 @@
 # ota-touchid
 
-Over-the-air Touch ID authentication for remote Macs. Approve Touch ID prompts on a Mac with Touch ID and relay the result to a remote Mac over the local network.
+Over-the-air Touch ID authentication for remote Macs. Press Touch ID on the client Mac, and the server verifies that biometric-backed assertion over the local network.
 
 Built on Secure Enclave, TLS, and Bonjour. Zero passwords — every authentication is a biometric event signed by hardware.
 
@@ -17,22 +17,23 @@ curl -fsSL https://raw.githubusercontent.com/pproenca/ota-touchid/master/scripts
 ### Requirements
 
 - macOS (Apple Silicon)
-- Touch ID (server Mac)
+- Touch ID (client Mac that runs `auth`/`enroll`)
 
 ## Quick start
 
-On the Mac with Touch ID (server):
+On the server Mac:
 
 ```bash
-ota-touchid setup
+ota-touchid setup --server
 ```
 
 This installs the launchd service and prints a one-line pairing token.
 
-On the remote Mac (client):
+On the client Mac (where you will press Touch ID):
 
 ```bash
 ota-touchid pair <pairing-bundle>
+ota-touchid enroll
 ota-touchid test
 ota-touchid auth --reason sudo
 ```
@@ -44,6 +45,7 @@ ota-touchid auth --reason sudo
 | `setup` | Generate keys, install server as launchd agent |
 | `pair <pairing-bundle\|psk>` / `pair --stdin` | Import pairing data on client |
 | `trust <server-public-key-base64>` | Pin trusted server key on client |
+| `enroll` | Register client Touch ID-backed key on server |
 | `auth` | Authenticate via Touch ID (exit 0=ok, 1=denied) |
 | `test` | Verify secure connectivity and server authenticity |
 | `serve` | Run server in foreground |
@@ -53,21 +55,21 @@ ota-touchid auth --reason sudo
 ### Auth options
 
 ```
---reason <text>              Reason shown in Touch ID prompt (default: "authentication")
---host <ip-or-hostname>       Direct connection (skip Bonjour discovery)
---port <port>                 Optional with --host (default: 45821)
---allow-tofu                 Explicitly allow trust-on-first-use for this auth attempt
+--reason <text>             Reason shown in client Touch ID prompt (default: "authentication")
+--host <ip-or-hostname>     Direct connection (skip Bonjour discovery)
+--port <port>               Optional with --host (default: 45821)
+--allow-tofu                Explicitly allow trust-on-first-use for this connection
 ```
 
 ## How it works
 
-1. **Server** runs on a Mac with Touch ID. On `setup`, it creates a P256 key pair in the Secure Enclave and a pre-shared key (PSK) for client authentication.
+1. **Server** runs as a launchd agent. On `setup`, it creates a Secure Enclave identity key and a PSK.
 
-2. **Client** discovers the server via Bonjour (or uses direct/cached endpoint). It sends an authenticated request transcript MAC (HMAC-SHA256 over mode + nonce + reason + hostname + flags).
+2. **Client** imports the pairing bundle and runs `enroll`, which creates a Touch ID-protected Secure Enclave key on the client and registers its public key on the server.
 
-3. **Server** validates the request MAC. For auth mode, it prompts Touch ID and signs a transcript payload (`nonceC || nonceS || reasonDigest || channelBinding`) using Secure Enclave.
+3. **Client auth** (`ota-touchid auth`) prompts Touch ID on the client, signs a channel-bound transcript, and sends that signature plus HMAC-authenticated request data.
 
-4. **Client** verifies response MAC (PSK + TLS channel binding) and then verifies Secure Enclave signature against pinned server key.
+4. **Server** verifies the enrolled client key signature, then returns a server-signed response; the client verifies response MAC + server signature against its pinned server key.
 
 All traffic is TLS-encrypted with channel binding to prevent MITM attacks. The server rate-limits requests and logs every authentication event to `~/.config/ota-touchid/audit.log`.
 
@@ -77,6 +79,7 @@ All traffic is TLS-encrypted with channel binding to prevent MITM attacks. The s
 - **TLS** — all traffic encrypted
 - **Transcript MACs** — request/response integrity authenticated with HMAC-SHA256
 - **Channel binding** — response MAC/signature include TLS certificate fingerprint
+- **Enrolled client key** — server only accepts assertions from a previously enrolled client public key
 - **Pinned server key** — client requires an explicit trusted server key; TOFU is opt-in per command (`--allow-tofu`)
 - **Rate limiting** — 5 attempts per source per 60 seconds
 - **Audit log** — every request logged with timestamp and source

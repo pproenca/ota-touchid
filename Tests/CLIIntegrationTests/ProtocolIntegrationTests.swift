@@ -26,7 +26,9 @@ struct ProtocolIntegrationTests {
             nonce: nonce,
             reason: reason,
             hasStoredKey: false,
-            requestMAC: requestMAC
+            requestMAC: requestMAC,
+            clientSignature: Data(repeating: 0x01, count: 64),
+            clientPublicKey: Data(repeating: 0x02, count: 65)
         )
         let requestFrame = try Frame.encode(request)
 
@@ -43,13 +45,14 @@ struct ProtocolIntegrationTests {
             source: "10.0.0.1:12345"
         )
 
-        guard case .auth(let validatedNonce, let validatedReason, _, let hasStoredKey, _) = validated else {
+        guard case .auth(let validatedNonce, let validatedReason, _, let clientPublicKey, let clientSig, _) = validated else {
             Issue.record("Expected .auth variant")
             return
         }
         #expect(validatedNonce == nonce)
         #expect(validatedReason == reason)
-        #expect(hasStoredKey == false)
+        #expect(clientPublicKey?.count == 65)
+        #expect(clientSig.count == 64)
 
         // === Server side: build response (simulating approval) ===
         let certFP = Data(repeating: 0xAB, count: 32)

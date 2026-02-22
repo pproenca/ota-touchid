@@ -6,7 +6,8 @@ import Foundation
 public enum AuthProof {
     private static let requestContext = Data("ota-touchid:req:v2".utf8)
     private static let responseContext = Data("ota-touchid:resp:v2".utf8)
-    private static let authSignatureContext = Data("ota-touchid:authsig:v2".utf8)
+    private static let clientSignatureContext = Data("ota-touchid:clientsig:v2".utf8)
+    private static let serverSignatureContext = Data("ota-touchid:serversig:v2".utf8)
 
     public static func computeRequestMAC(
         psk: SymmetricKey,
@@ -102,8 +103,29 @@ public enum AuthProof {
         return constantTimeEqual(proofData, expected)
     }
 
-    /// Transcript that the server signs via Secure Enclave in auth mode.
-    public static func authSignaturePayload(
+    /// Transcript that a client signs (after local Touch ID) to prove user presence.
+    public static func clientSignaturePayload(
+        mode: String,
+        nonce: Data,
+        reason: String,
+        hostname: String,
+        certFingerprint: Data
+    ) -> Data {
+        transcript(
+            context: clientSignatureContext,
+            fields: [
+                Data(mode.utf8),
+                nonce,
+                digest(reason),
+                digest(hostname),
+                certFingerprint,
+            ]
+        )
+    }
+
+    /// Transcript that the server signs to prove server identity.
+    public static func serverSignaturePayload(
+        mode: String,
         nonceC: Data,
         nonceS: Data,
         approved: Bool,
@@ -111,15 +133,33 @@ public enum AuthProof {
         certFingerprint: Data
     ) -> Data {
         transcript(
-            context: authSignatureContext,
+            context: serverSignatureContext,
             fields: [
-                Data("auth".utf8),
+                Data(mode.utf8),
                 nonceC,
                 nonceS,
                 Data([approved ? 1 : 0]),
                 digest(reason),
                 certFingerprint,
             ]
+        )
+    }
+
+    /// Backward-compat shim for existing call sites/tests.
+    public static func authSignaturePayload(
+        nonceC: Data,
+        nonceS: Data,
+        approved: Bool,
+        reason: String,
+        certFingerprint: Data
+    ) -> Data {
+        serverSignaturePayload(
+            mode: "auth",
+            nonceC: nonceC,
+            nonceS: nonceS,
+            approved: approved,
+            reason: reason,
+            certFingerprint: certFingerprint
         )
     }
 

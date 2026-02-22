@@ -128,6 +128,35 @@ struct AuthProofTests {
         )
         #expect(a != b)
     }
+
+    @Test("client signature payload binds mode and hostname")
+    func clientSignaturePayloadBindsModeAndHostname() {
+        let nonce = Data(repeating: 0x66, count: OTA.nonceSize)
+        let certFP = Data(repeating: 0x77, count: 32)
+        let auth = AuthProof.clientSignaturePayload(
+            mode: "auth",
+            nonce: nonce,
+            reason: "sudo",
+            hostname: "client-a.local",
+            certFingerprint: certFP
+        )
+        let enroll = AuthProof.clientSignaturePayload(
+            mode: "enroll",
+            nonce: nonce,
+            reason: "sudo",
+            hostname: "client-a.local",
+            certFingerprint: certFP
+        )
+        let otherHost = AuthProof.clientSignaturePayload(
+            mode: "auth",
+            nonce: nonce,
+            reason: "sudo",
+            hostname: "client-b.local",
+            certFingerprint: certFP
+        )
+        #expect(auth != enroll)
+        #expect(auth != otherHost)
+    }
 }
 
 @Suite("Source rate limiter")

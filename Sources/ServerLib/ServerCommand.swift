@@ -1,6 +1,5 @@
 import CryptoKit
 import Foundation
-import LocalAuthentication
 import Network
 import Security
 import Shared
@@ -80,13 +79,19 @@ private func logErr(_ message: String) {
 // MARK: - Key Management
 
 private let keyFile = OTA.configDir.appendingPathComponent("server.key")
+private let trustedClientKeyFile = OTA.trustedClientKeyFile
 
 private func loadOrCreateKey() throws -> SecureEnclave.P256.Signing.PrivateKey {
     let fm = FileManager.default
     try fm.createDirectory(at: OTA.configDir, withIntermediateDirectories: true)
 
-    if let blob = try? Data(contentsOf: keyFile) {
-        return try SecureEnclave.P256.Signing.PrivateKey(dataRepresentation: blob)
+    if let blob = try? Data(contentsOf: keyFile),
+       let key = try? SecureEnclave.P256.Signing.PrivateKey(dataRepresentation: blob)
+    {
+        if canSignWithoutUserPresence(key) {
+            return key
+        }
+        logErr("Existing server key requires user presence; rotating to non-interactive identity key.")
     }
 
     guard SecureEnclave.isAvailable else {
@@ -96,8 +101,8 @@ private func loadOrCreateKey() throws -> SecureEnclave.P256.Signing.PrivateKey {
     var cfError: Unmanaged<CFError>?
     guard let acl = SecAccessControlCreateWithFlags(
         nil,
-        kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
-        [.privateKeyUsage, .biometryCurrentSet],
+        kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+        [.privateKeyUsage],
         &cfError
     ) else {
         throw cfError!.takeRetainedValue()
@@ -110,10 +115,20 @@ private func loadOrCreateKey() throws -> SecureEnclave.P256.Signing.PrivateKey {
         .appendingPathComponent(UUID().uuidString)
     let data = key.dataRepresentation
     fm.createFile(atPath: tmpFile.path, contents: data, attributes: [.posixPermissions: 0o600])
+    try? fm.removeItem(at: keyFile)
     try fm.moveItem(at: tmpFile, to: keyFile)
 
-    logErr("Created new Secure Enclave key pair.")
+    logErr("Created new Secure Enclave server identity key.")
     return key
+}
+
+private func canSignWithoutUserPresence(_ key: SecureEnclave.P256.Signing.PrivateKey) -> Bool {
+    do {
+        _ = try key.signature(for: Data("ota-touchid-server-probe".utf8))
+        return true
+    } catch {
+        return false
+    }
 }
 
 // MARK: - PSK (Pre-Shared Key) for Client Authentication [C2]
@@ -168,22 +183,36 @@ private func auditLog(_ message: String) {
     }
 }
 
-// MARK: - Touch ID Signing
+// MARK: - Signing + Trusted Client Key Storage
 
-private func sign(data: Data, keyBlob: Data, reason: String) async throws
-    -> P256.Signing.ECDSASignature
-{
-    let ctx = LAContext()
-    try await ctx.evaluatePolicy(
-        .deviceOwnerAuthenticationWithBiometrics,
-        localizedReason: reason
-    )
-
-    let key = try SecureEnclave.P256.Signing.PrivateKey(
-        dataRepresentation: keyBlob,
-        authenticationContext: ctx
-    )
+private func sign(data: Data, keyBlob: Data) throws -> P256.Signing.ECDSASignature {
+    let key = try SecureEnclave.P256.Signing.PrivateKey(dataRepresentation: keyBlob)
     return try key.signature(for: data)
+}
+
+private func loadTrustedClientPublicKey() throws -> P256.Signing.PublicKey? {
+    guard FileManager.default.fileExists(atPath: trustedClientKeyFile.path) else { return nil }
+    let rawBase64 = try String(contentsOf: trustedClientKeyFile, encoding: .utf8)
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    guard let raw = Data(base64Encoded: rawBase64) else {
+        throw OTAError.badRequest("stored trusted client key is invalid")
+    }
+    return try P256.Signing.PublicKey(rawRepresentation: raw)
+}
+
+private func storeTrustedClientPublicKey(_ raw: Data) throws {
+    _ = try P256.Signing.PublicKey(rawRepresentation: raw)
+    let fm = FileManager.default
+    try fm.createDirectory(at: OTA.configDir, withIntermediateDirectories: true)
+    let tmpFile = trustedClientKeyFile.deletingLastPathComponent()
+        .appendingPathComponent(UUID().uuidString)
+    fm.createFile(
+        atPath: tmpFile.path,
+        contents: raw.base64EncodedString().data(using: .utf8),
+        attributes: [.posixPermissions: 0o600]
+    )
+    try? fm.removeItem(at: trustedClientKeyFile)
+    try fm.moveItem(at: tmpFile, to: trustedClientKeyFile)
 }
 
 // MARK: - Server
@@ -376,11 +405,106 @@ private final class Server: @unchecked Sendable {
                 on: conn
             )
 
-        case .auth(let nonce, let reason, let hostname, let hasStoredKey, _):
-            let trimmedReason = reason.trimmingCharacters(in: .whitespacesAndNewlines)
-            let displayReason = trimmedReason.isEmpty
-                ? "OTA Touch ID request from \(source)"
-                : "OTA Touch ID: \(String(trimmedReason.prefix(80)))"
+        case .enroll(let nonce, let hostname, let clientPublicKey, let clientSignature, _):
+            log("[\(source)] enroll request (client hostname: \(hostname))")
+            let nonceS: Data
+            do {
+                nonceS = try randomNonce()
+            } catch {
+                logErr("  nonce generation failed: \(error.localizedDescription)")
+                reply(.init(mode: "enroll", approved: false, error: "Internal server error"), on: conn)
+                return
+            }
+
+            let denied: (String) -> Void = { message in
+                let responseMAC = AuthProof.computeResponseMAC(
+                    psk: self.psk,
+                    mode: "enroll",
+                    nonceC: nonce,
+                    nonceS: nonceS,
+                    approved: false,
+                    signature: nil,
+                    error: message,
+                    certFingerprint: self.certFingerprint
+                )
+                self.reply(
+                    .init(
+                        mode: "enroll",
+                        approved: false,
+                        nonceS: nonceS,
+                        responseMAC: responseMAC,
+                        error: message
+                    ),
+                    on: conn
+                )
+            }
+
+            do {
+                let providedKey = try P256.Signing.PublicKey(rawRepresentation: clientPublicKey)
+                let signature = try P256.Signing.ECDSASignature(rawRepresentation: clientSignature)
+                let payload = AuthProof.clientSignaturePayload(
+                    mode: "enroll",
+                    nonce: nonce,
+                    reason: "enroll",
+                    hostname: hostname,
+                    certFingerprint: certFingerprint
+                )
+                guard providedKey.isValidSignature(signature, for: payload) else {
+                    throw OTAError.signatureVerificationFailed
+                }
+
+                if let stored = try loadTrustedClientPublicKey() {
+                    guard stored.rawRepresentation == clientPublicKey else {
+                        logErr("  rejected enroll: different client key already enrolled")
+                        auditLog("ENROLL_REJECTED source=\(source) reason=different_key")
+                        denied("Different client key already enrolled")
+                        return
+                    }
+                    log("  enroll idempotent (same client key)")
+                    auditLog("ENROLL_OK source=\(source) hostname=\(hostname) idempotent=true")
+                } else {
+                    try storeTrustedClientPublicKey(clientPublicKey)
+                    log("  enrolled trusted client key (\(keyFingerprint(clientPublicKey)))")
+                    auditLog("ENROLL_OK source=\(source) hostname=\(hostname) idempotent=false")
+                }
+
+                let serverSignedData = AuthProof.serverSignaturePayload(
+                    mode: "enroll",
+                    nonceC: nonce,
+                    nonceS: nonceS,
+                    approved: true,
+                    reason: "enroll",
+                    certFingerprint: self.certFingerprint
+                )
+                let serverSig = try sign(data: serverSignedData, keyBlob: keyBlob)
+                let responseMAC = AuthProof.computeResponseMAC(
+                    psk: self.psk,
+                    mode: "enroll",
+                    nonceC: nonce,
+                    nonceS: nonceS,
+                    approved: true,
+                    signature: serverSig.rawRepresentation,
+                    error: nil,
+                    certFingerprint: self.certFingerprint
+                )
+                self.reply(
+                    .init(
+                        mode: "enroll",
+                        approved: true,
+                        nonceS: nonceS,
+                        signature: serverSig.rawRepresentation,
+                        publicKey: self.publicKeyRaw,
+                        responseMAC: responseMAC
+                    ),
+                    on: conn
+                )
+            } catch {
+                logErr("  enroll failed: \(error.localizedDescription)")
+                auditLog("ENROLL_FAILED source=\(source) hostname=\(hostname) error=\(error.localizedDescription)")
+                denied("Enrollment failed")
+            }
+
+        case .auth(let nonce, let reason, let hostname, let clientPublicKey, let clientSignature, _):
             log("[\(source)] auth request (client hostname: \(hostname))")
             let nonceS: Data
             do {
@@ -391,68 +515,90 @@ private final class Server: @unchecked Sendable {
                 return
             }
 
-            Task {
-                do {
-                    let signedData = AuthProof.authSignaturePayload(
-                        nonceC: nonce,
-                        nonceS: nonceS,
-                        approved: true,
-                        reason: reason,
-                        certFingerprint: self.certFingerprint
-                    )
-                    let sig = try await sign(
-                        data: signedData,
-                        keyBlob: keyBlob,
-                        reason: displayReason
-                    )
-                    log("  approved")
-                    auditLog("APPROVED source=\(source) hostname=\(hostname)")
-                    let pubKey: Data? = hasStoredKey ? nil : publicKeyRaw
-                    let responseMAC = AuthProof.computeResponseMAC(
-                        psk: self.psk,
+            let denied: (String) -> Void = { message in
+                let responseMAC = AuthProof.computeResponseMAC(
+                    psk: self.psk,
+                    mode: "auth",
+                    nonceC: nonce,
+                    nonceS: nonceS,
+                    approved: false,
+                    signature: nil,
+                    error: message,
+                    certFingerprint: self.certFingerprint
+                )
+                self.reply(
+                    .init(
                         mode: "auth",
-                        nonceC: nonce,
-                        nonceS: nonceS,
-                        approved: true,
-                        signature: sig.rawRepresentation,
-                        error: nil,
-                        certFingerprint: self.certFingerprint
-                    )
-                    self.reply(
-                        .init(
-                            mode: "auth",
-                            approved: true,
-                            nonceS: nonceS,
-                            signature: sig.rawRepresentation,
-                            publicKey: pubKey,
-                            responseMAC: responseMAC
-                        ),
-                        on: conn)
-                } catch {
-                    log("  denied (\(error.localizedDescription))")
-                    auditLog("DENIED source=\(source) hostname=\(hostname) error=\(error.localizedDescription)")
-                    let deniedError = "Authentication denied"
-                    let responseMAC = AuthProof.computeResponseMAC(
-                        psk: self.psk,
-                        mode: "auth",
-                        nonceC: nonce,
-                        nonceS: nonceS,
                         approved: false,
-                        signature: nil,
-                        error: deniedError,
-                        certFingerprint: self.certFingerprint
-                    )
-                    reply(
-                        .init(
-                            mode: "auth",
-                            approved: false,
-                            nonceS: nonceS,
-                            responseMAC: responseMAC,
-                            error: deniedError
-                        ),
-                        on: conn
-                    )
+                        nonceS: nonceS,
+                        responseMAC: responseMAC,
+                        error: message
+                    ),
+                    on: conn
+                )
+            }
+
+            do {
+                guard let trustedClientKey = try loadTrustedClientPublicKey() else {
+                    throw OTAError.clientNotEnrolled
                 }
+                if let clientPublicKey,
+                   clientPublicKey != trustedClientKey.rawRepresentation {
+                    throw OTAError.authenticationFailed
+                }
+
+                let signature = try P256.Signing.ECDSASignature(rawRepresentation: clientSignature)
+                let clientPayload = AuthProof.clientSignaturePayload(
+                    mode: "auth",
+                    nonce: nonce,
+                    reason: reason,
+                    hostname: hostname,
+                    certFingerprint: certFingerprint
+                )
+                guard trustedClientKey.isValidSignature(signature, for: clientPayload) else {
+                    throw OTAError.signatureVerificationFailed
+                }
+
+                let signedData = AuthProof.serverSignaturePayload(
+                    mode: "auth",
+                    nonceC: nonce,
+                    nonceS: nonceS,
+                    approved: true,
+                    reason: reason,
+                    certFingerprint: self.certFingerprint
+                )
+                let serverSig = try sign(data: signedData, keyBlob: keyBlob)
+                let responseMAC = AuthProof.computeResponseMAC(
+                    psk: self.psk,
+                    mode: "auth",
+                    nonceC: nonce,
+                    nonceS: nonceS,
+                    approved: true,
+                    signature: serverSig.rawRepresentation,
+                    error: nil,
+                    certFingerprint: self.certFingerprint
+                )
+                log("  approved")
+                auditLog("APPROVED source=\(source) hostname=\(hostname)")
+                self.reply(
+                    .init(
+                        mode: "auth",
+                        approved: true,
+                        nonceS: nonceS,
+                        signature: serverSig.rawRepresentation,
+                        publicKey: self.publicKeyRaw,
+                        responseMAC: responseMAC
+                    ),
+                    on: conn
+                )
+            } catch OTAError.clientNotEnrolled {
+                logErr("  denied: client not enrolled")
+                auditLog("DENIED source=\(source) hostname=\(hostname) error=client_not_enrolled")
+                denied("Client not enrolled (run 'ota-touchid enroll' on client)")
+            } catch {
+                log("  denied (\(error.localizedDescription))")
+                auditLog("DENIED source=\(source) hostname=\(hostname) error=\(error.localizedDescription)")
+                denied("Authentication denied")
             }
         }
     }

@@ -73,6 +73,36 @@ case "auth":
     }
     ClientCommand.auth(reason: reason, host: host, port: port, allowTOFU: allowTOFU)
 
+case "enroll":
+    var host: String?
+    var port: UInt16?
+    var allowTOFU = false
+    var i = 1
+    while i < args.count {
+        switch args[i] {
+        case "--host" where i + 1 < args.count:
+            i += 1; host = args[i]
+        case "--port" where i + 1 < args.count:
+            i += 1
+            guard let p = UInt16(args[i]) else {
+                fputs("Error: Invalid port '\(args[i])'\n", stderr)
+                exit(1)
+            }
+            port = p
+        case "--allow-tofu":
+            allowTOFU = true
+        default:
+            fputs("Unknown option: \(args[i])\n", stderr)
+            exit(1)
+        }
+        i += 1
+    }
+    if host == nil, port != nil {
+        fputs("Error: --port requires --host\n", stderr)
+        exit(1)
+    }
+    ClientCommand.enroll(host: host, port: port, allowTOFU: allowTOFU)
+
 case "pair":
     let pskInput: String
     if args.count == 2, args[1] != "--stdin" {
@@ -157,7 +187,7 @@ enum SetupCommand {
 
         // Interactive prompt if no role flag
         if role == nil {
-            fputs("Set up this Mac as:\n  1) Server (has Touch ID)\n  2) Client (remote machine)\nChoice [1/2]: ", stderr)
+            fputs("Set up this Mac as:\n  1) Server (runs background verifier)\n  2) Client (where Touch ID is pressed)\nChoice [1/2]: ", stderr)
             guard let line = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) else {
                 fputs("No input. Aborting.\n", stderr)
                 exit(1)
@@ -277,9 +307,11 @@ enum SetupCommand {
             print("")
             print("To set up a client Mac (same Apple ID — auto-pairing):")
             print("  ota-touchid setup --client")
+            print("  ota-touchid enroll")
             print("")
             print("To set up a client Mac (different Apple ID — one command):")
             print("  ota-touchid pair \(pairingToken)")
+            print("  ota-touchid enroll --host \(ProcessInfo.processInfo.hostName)")
             print("")
             print("Then verify with:")
             print("  ota-touchid test")
@@ -296,6 +328,9 @@ enum SetupCommand {
             print("")
             print("OTA Touch ID Client Setup Complete")
             print(String(repeating: "\u{2500}", count: 40))
+            print("Enroll this client key on the server:")
+            print("  ota-touchid enroll")
+            print("")
             print("Verify connectivity:")
             print("  ota-touchid test")
             print("")
@@ -427,6 +462,8 @@ enum StatusCommand {
         // Server key
         let serverKeyPath = configDir.appendingPathComponent("server.key").path
         print("Server key:  \(fm.fileExists(atPath: serverKeyPath) ? "present" : "not found")")
+        let clientKeyPath = configDir.appendingPathComponent("client.pub").path
+        print("Client key (server trust): \(fm.fileExists(atPath: clientKeyPath) ? "present" : "not found")")
 
         // Client-side status
         ClientCommand.status()
@@ -511,7 +548,7 @@ func printUsage() {
 
         Usage:
           ota-touchid setup [--server | --client] [--psk <base64>]
-              Interactive install. Sets up server (Touch ID Mac) or client (remote Mac).
+              Interactive install. Sets up server (verifier) or client (Touch ID device).
               Same-Apple-ID devices auto-pair via iCloud Keychain.
 
           ota-touchid pair <pairing-bundle|psk-base64>
@@ -522,6 +559,9 @@ func printUsage() {
 
           ota-touchid trust <server-public-key-base64>
               Pin the server public key on this client.
+
+          ota-touchid enroll [--host <ip-or-hostname>] [--port <port>] [--allow-tofu]
+              Enroll this client's Touch ID-backed key on the server.
 
           ota-touchid test [--host <ip-or-hostname>] [--port <port>]
               Verify connectivity to server (no Touch ID prompt).
@@ -543,6 +583,7 @@ func printUsage() {
         Quick start (client Mac, same Apple ID):
           brew install pproenca/tap/ota-touchid
           ota-touchid setup --client
+          ota-touchid enroll
           ota-touchid test
           ota-touchid auth --reason sudo
         """)

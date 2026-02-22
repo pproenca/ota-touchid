@@ -4,7 +4,21 @@ import Foundation
 /// Result of validating an incoming AuthRequest frame.
 public enum ValidatedRequest {
     case test(nonce: Data, hostname: String, source: String)
-    case auth(nonce: Data, reason: String, hostname: String, hasStoredKey: Bool, source: String)
+    case enroll(
+        nonce: Data,
+        hostname: String,
+        clientPublicKey: Data,
+        clientSignature: Data,
+        source: String
+    )
+    case auth(
+        nonce: Data,
+        reason: String,
+        hostname: String,
+        clientPublicKey: Data?,
+        clientSignature: Data,
+        source: String
+    )
 }
 
 /// Validates a raw AuthRequest payload. Pure function, no side effects.
@@ -32,7 +46,7 @@ public func validateAuthRequest(
     }
 
     let mode = req.mode ?? "auth"
-    guard mode == "auth" || mode == "test" else {
+    guard mode == "auth" || mode == "test" || mode == "enroll" else {
         throw OTAError.badRequest("invalid mode")
     }
 
@@ -54,11 +68,34 @@ public func validateAuthRequest(
         return .test(nonce: nonce, hostname: req.hostname, source: source)
     }
 
+    guard let signatureBase64 = req.clientSignature,
+          let clientSignature = Data(base64Encoded: signatureBase64),
+          clientSignature.count == 64
+    else {
+        throw OTAError.badRequest("missing or invalid client signature")
+    }
+
+    let clientPublicKey = req.clientPublicKey.flatMap { Data(base64Encoded: $0) }
+
+    if mode == "enroll" {
+        guard let clientPublicKey else {
+            throw OTAError.badRequest("missing client public key")
+        }
+        return .enroll(
+            nonce: nonce,
+            hostname: req.hostname,
+            clientPublicKey: clientPublicKey,
+            clientSignature: clientSignature,
+            source: source
+        )
+    }
+
     return .auth(
         nonce: nonce,
         reason: req.reason,
         hostname: req.hostname,
-        hasStoredKey: req.hasStoredKey,
+        clientPublicKey: clientPublicKey,
+        clientSignature: clientSignature,
         source: source
     )
 }

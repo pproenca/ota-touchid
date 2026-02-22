@@ -103,6 +103,13 @@ struct CLISmokeTests {
         #expect(result.stderr.contains("Unknown option"))
     }
 
+    @Test("enroll rejects invalid port values")
+    func enrollRejectsInvalidPort() throws {
+        let result = try runCLI(["enroll", "--host", "127.0.0.1", "--port", "not-a-port"])
+        #expect(result.status == 1)
+        #expect(result.stderr.contains("Invalid port"))
+    }
+
     @Test("test rejects unknown flags")
     func testRejectsUnknownFlag() throws {
         let result = try runCLI(["test", "--nope"])
@@ -116,6 +123,7 @@ struct CLISmokeTests {
         #expect(result.stdout.contains("setup"))
         #expect(result.stdout.contains("pair"))
         #expect(result.stdout.contains("trust"))
+        #expect(result.stdout.contains("enroll"))
         #expect(result.stdout.contains("test"))
         #expect(result.stdout.contains("auth"))
         #expect(result.stdout.contains("status"))
