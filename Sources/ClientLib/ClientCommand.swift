@@ -44,6 +44,9 @@ public enum ClientCommand {
             throw OTAError.badRequest("invalid PSK (expected 32-byte base64)")
         }
         let fm = FileManager.default
+        if fm.fileExists(atPath: OTA.pskFile.path) {
+            fputs("Existing configuration found. Replacing...\n", stderr)
+        }
         try fm.createDirectory(at: OTA.configDir, withIntermediateDirectories: true)
         let tmpFile = OTA.pskFile.deletingLastPathComponent()
             .appendingPathComponent(UUID().uuidString)
@@ -52,6 +55,7 @@ public enum ClientCommand {
             contents: pskBase64.data(using: .utf8),
             attributes: [.posixPermissions: 0o600]
         )
+        try? fm.removeItem(at: OTA.pskFile)
         try fm.moveItem(at: tmpFile, to: OTA.pskFile)
         print("PSK saved to \(OTA.pskFile.path)")
     }
@@ -169,6 +173,7 @@ private func storePublicKey(_ base64: String) throws {
         contents: base64.data(using: .utf8),
         attributes: [.posixPermissions: 0o600]
     )
+    try? fm.removeItem(at: pubKeyFile)
     try fm.moveItem(at: tmpFile, to: pubKeyFile)
 }
 

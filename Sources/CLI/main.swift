@@ -168,6 +168,9 @@ enum SetupCommand {
             try FileManager.default.createDirectory(at: plistDir, withIntermediateDirectories: true)
 
             let plistPath = plistDir.appendingPathComponent("com.ota-touchid.server.plist")
+            if FileManager.default.fileExists(atPath: plistPath.path) {
+                fputs("Replacing existing launchd agent...\n", stderr)
+            }
             let plistContent = launchdPlist(binaryPath: binaryPath)
             try plistContent.write(to: plistPath, atomically: true, encoding: .utf8)
 
@@ -179,6 +182,20 @@ enum SetupCommand {
             unload.standardError = FileHandle.nullDevice
             try? unload.run()
             unload.waitUntilExit()
+
+            // Kill any stale ota-touchid serve processes running outside launchd
+            let pkill = Process()
+            pkill.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+            pkill.arguments = ["-f", "ota-touchid serve"]
+            pkill.standardOutput = FileHandle.nullDevice
+            pkill.standardError = FileHandle.nullDevice
+            try? pkill.run()
+            pkill.waitUntilExit()
+
+            // Truncate stale log files so fresh logs start clean
+            for logPath in ["/tmp/ota-touchid.out.log", "/tmp/ota-touchid.err.log"] {
+                FileManager.default.createFile(atPath: logPath, contents: nil)
+            }
 
             let load = Process()
             load.executableURL = URL(fileURLWithPath: "/bin/launchctl")

@@ -68,6 +68,8 @@ private func createEphemeralIdentity() throws -> (sec_identity_t, Data) {
         SecItemDelete([kSecClass: cls, kSecAttrLabel: keychainLabel] as CFDictionary)
     }
     SecItemDelete([kSecClass: kSecClassCertificate, kSecAttrLabel: certCN] as CFDictionary)
+    // Clean up orphaned certs from pre-v0.1.3 stored under the old label
+    SecItemDelete([kSecClass: kSecClassCertificate, kSecAttrLabel: keychainLabel] as CFDictionary)
 
     // 1. Generate ephemeral P-256 key pair in the Keychain
     let keyTag = keychainLabel.data(using: .utf8)!
