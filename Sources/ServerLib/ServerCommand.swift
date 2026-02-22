@@ -148,10 +148,6 @@ private func loadOrCreatePSK() throws -> SymmetricKey {
     return key
 }
 
-private func verifyClientProof(proof: String?, nonce: Data, psk: SymmetricKey) -> Bool {
-    AuthProof.verify(proofBase64: proof, nonce: nonce, psk: psk)
-}
-
 // MARK: - Audit Logging [L2]
 
 private let auditFile = OTA.configDir.appendingPathComponent("audit.log")
@@ -272,77 +268,56 @@ private final class Server: @unchecked Sendable {
     private func handleRequest(_ data: Data, on conn: NWConnection) {
         let source = sourceLabel(for: conn)
 
-        // [M1] Rate limiting per source
-        guard rateLimiter.shouldAllow(source: source) else {
-            auditLog("RATE_LIMITED source=\(source)")
-            logErr("  rate limited: \(source)")
-            reply(.init(approved: false, error: "Rate limited"), on: conn)
-            return
-        }
-
-        let req: AuthRequest
-        let nonce: Data
+        let validated: ValidatedRequest
         do {
-            req = try Frame.decode(AuthRequest.self, from: data)
-            guard let decoded = Data(base64Encoded: req.nonce), decoded.count == OTA.nonceSize
-            else {
-                throw OTAError.badRequest("invalid nonce")
-            }
-            nonce = decoded
+            validated = try validateAuthRequest(
+                payload: data,
+                psk: psk,
+                rateLimiter: rateLimiter,
+                source: source
+            )
+        } catch let error as OTAError where error.clientDescription == "Authentication failed" {
+            logErr("  rejected (bad PSK) from \(source)")
+            auditLog("AUTH_FAILED source=\(source) reason=bad_psk")
+            reply(.init(approved: false, error: error.clientDescription), on: conn)
+            return
         } catch {
             logErr("  bad request from \(source): \(error.localizedDescription)")
             auditLog("BAD_REQUEST source=\(source) error=\(error.localizedDescription)")
-            // [L1] Generic error to client
             let clientError = (error as? OTAError)?.clientDescription ?? "Bad request"
             reply(.init(approved: false, error: clientError), on: conn)
             return
         }
 
-        // [C2] Verify client PSK proof before showing Touch ID
-        guard verifyClientProof(proof: req.clientProof, nonce: nonce, psk: psk) else {
-            logErr("  rejected (bad PSK) from \(source) [\(req.hostname)]")
-            auditLog("AUTH_FAILED source=\(source) hostname=\(req.hostname) reason=bad_psk")
-            reply(
-                .init(approved: false, error: OTAError.authenticationFailed.clientDescription),
-                on: conn)
-            return
-        }
-
-        // Test mode: PSK verified, skip Touch ID
-        if req.mode == "test" {
-            log("[\(source)] test request (client hostname: \(req.hostname)) — OK")
-            auditLog("TEST_OK source=\(source) hostname=\(req.hostname)")
+        switch validated {
+        case .test(let hostname, _):
+            log("[\(source)] test request (client hostname: \(hostname)) — OK")
+            auditLog("TEST_OK source=\(source) hostname=\(hostname)")
             reply(.init(approved: true), on: conn)
-            return
-        }
 
-        // [C3/M5] Fixed reason with source IP — never use client-supplied text in Touch ID prompt
-        let displayReason = "OTA Touch ID request from \(source)"
-        log("[\(source)] auth request (client hostname: \(req.hostname))")
+        case .auth(let nonce, let hostname, let hasStoredKey, _):
+            let displayReason = "OTA Touch ID request from \(source)"
+            log("[\(source)] auth request (client hostname: \(hostname))")
 
-        Task {
-            do {
-                // [M2] Channel binding: sign nonce + TLS cert fingerprint
-                let signedData = nonce + self.certFingerprint
-                let sig = try await sign(
-                    data: signedData,
-                    keyBlob: keyBlob,
-                    reason: displayReason
-                )
-                log("  approved")
-                auditLog("APPROVED source=\(source) hostname=\(req.hostname)")
-                // [H3] Only send public key when client doesn't already have it
-                let pubKey: Data? = req.hasStoredKey ? nil : publicKeyRaw
-                self.reply(
-                    .init(approved: true, signature: sig.rawRepresentation, publicKey: pubKey),
-                    on: conn)
-            } catch {
-                log("  denied (\(error.localizedDescription))")
-                auditLog(
-                    "DENIED source=\(source) hostname=\(req.hostname) error=\(error.localizedDescription)"
-                )
-                // [L1] Generic error to client
-                reply(.init(approved: false, error: "Authentication denied"), on: conn)
+            Task {
+                do {
+                    let signedData = nonce + self.certFingerprint
+                    let sig = try await sign(
+                        data: signedData,
+                        keyBlob: keyBlob,
+                        reason: displayReason
+                    )
+                    log("  approved")
+                    auditLog("APPROVED source=\(source) hostname=\(hostname)")
+                    let pubKey: Data? = hasStoredKey ? nil : publicKeyRaw
+                    self.reply(
+                        .init(approved: true, signature: sig.rawRepresentation, publicKey: pubKey),
+                        on: conn)
+                } catch {
+                    log("  denied (\(error.localizedDescription))")
+                    auditLog("DENIED source=\(source) hostname=\(hostname) error=\(error.localizedDescription)")
+                    reply(.init(approved: false, error: "Authentication denied"), on: conn)
+                }
             }
         }
     }
