@@ -209,6 +209,19 @@ enum SetupCommand {
                 return
             }
 
+            // Check macOS firewall and add exception for Bonjour discovery
+            configureFirewall(binaryPath: binaryPath)
+
+            // Brief pause for launchd to start the server, then check logs for errors
+            Thread.sleep(forTimeInterval: 1.0)
+            if let errLog = try? String(contentsOfFile: "/tmp/ota-touchid.err.log", encoding: .utf8),
+               errLog.contains("Fatal:") {
+                fputs("\nWarning: Server failed to start. Error log:\n", stderr)
+                fputs(errLog, stderr)
+                fputs("\nTry: ota-touchid uninstall && ota-touchid setup --server\n", stderr)
+                return
+            }
+
             print("")
             print("OTA Touch ID Server Setup Complete")
             print(String(repeating: "\u{2500}", count: 40))
@@ -292,6 +305,51 @@ enum SetupCommand {
         </dict>
         </plist>
         """
+    }
+    /// Check macOS firewall and add an exception for the server binary.
+    private static func configureFirewall(binaryPath: String) {
+        let fw = "/usr/libexec/ApplicationFirewall/socketfilterfw"
+        guard FileManager.default.fileExists(atPath: fw) else { return }
+
+        // Check if the firewall is on
+        let check = Process()
+        check.executableURL = URL(fileURLWithPath: fw)
+        check.arguments = ["--getglobalstate"]
+        let pipe = Pipe()
+        check.standardOutput = pipe
+        check.standardError = FileHandle.nullDevice
+        try? check.run()
+        check.waitUntilExit()
+
+        let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        guard output.contains("enabled") else { return }
+
+        fputs("\nFirewall is enabled. Adding exception for ota-touchid...\n", stderr)
+        fputs("(You may be prompted for your password)\n", stderr)
+
+        // Add the binary and unblock it
+        let add = Process()
+        add.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
+        add.arguments = [fw, "--add", binaryPath]
+        add.standardOutput = FileHandle.nullDevice
+        add.standardError = FileHandle.nullDevice
+        try? add.run()
+        add.waitUntilExit()
+
+        let unblock = Process()
+        unblock.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
+        unblock.arguments = [fw, "--unblockapp", binaryPath]
+        unblock.standardOutput = FileHandle.nullDevice
+        unblock.standardError = FileHandle.nullDevice
+        try? unblock.run()
+        unblock.waitUntilExit()
+
+        if unblock.terminationStatus == 0 {
+            fputs("Firewall exception added.\n", stderr)
+        } else {
+            fputs("Warning: Could not add firewall exception. You may need to manually allow\n", stderr)
+            fputs("ota-touchid in System Settings > Network > Firewall > Options.\n", stderr)
+        }
     }
 }
 

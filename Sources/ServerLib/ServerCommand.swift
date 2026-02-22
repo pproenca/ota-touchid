@@ -17,14 +17,14 @@ public enum ServerCommand {
 
             // [C1] TLS is mandatory — never fall back to plaintext TCP.
             let (params, certFingerprint) = try TLSConfig.serverParameters()
-            fputs("TLS enabled.\n", stderr)
+            logErr("TLS enabled.")
 
             let pskBase64 = psk.withUnsafeBytes { Data($0) }.base64EncodedString()
 
-            print("OTA Touch ID Server")
+            log("OTA Touch ID Server")
             print(String(repeating: "\u{2500}", count: 40))
-            print("Public key: \(pubRaw.base64EncodedString())")
-            print("PSK:        \(pskBase64)\n")
+            log("Public key: \(pubRaw.base64EncodedString())")
+            log("PSK:        \(pskBase64)")
 
             let server = try Server(
                 keyBlob: key.dataRepresentation,
@@ -37,7 +37,7 @@ public enum ServerCommand {
 
             dispatchMain()
         } catch {
-            fputs("Fatal: \(error.localizedDescription)\n", stderr)
+            logErr("Fatal: \(error.localizedDescription)")
             exit(1)
         }
     }
@@ -59,6 +59,22 @@ public enum ServerCommand {
         try SyncedKeychain.save(account: .preSharedKey, data: pskData)
         try SyncedKeychain.save(account: .serverPublicKey, data: pubKeyData)
     }
+}
+
+// MARK: - Timestamped Logging
+
+private let logDateFormatter: ISO8601DateFormatter = {
+    let f = ISO8601DateFormatter()
+    f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    return f
+}()
+
+private func log(_ message: String) {
+    print("[\(logDateFormatter.string(from: Date()))] \(message)")
+}
+
+private func logErr(_ message: String) {
+    fputs("[\(logDateFormatter.string(from: Date()))] \(message)\n", stderr)
 }
 
 // MARK: - Key Management
@@ -96,7 +112,7 @@ private func loadOrCreateKey() throws -> SecureEnclave.P256.Signing.PrivateKey {
     fm.createFile(atPath: tmpFile.path, contents: data, attributes: [.posixPermissions: 0o600])
     try fm.moveItem(at: tmpFile, to: keyFile)
 
-    fputs("Created new Secure Enclave key pair.\n", stderr)
+    logErr("Created new Secure Enclave key pair.")
     return key
 }
 
@@ -226,9 +242,9 @@ private final class Server: @unchecked Sendable {
     func start() {
         listener.stateUpdateHandler = { state in
             if case .ready = state, let port = self.listener.port {
-                print("Listening on port \(port.rawValue)")
-                print("Advertising via Bonjour (\(OTA.serviceType))\n")
-                print("Waiting for auth requests...")
+                log("Listening on port \(port.rawValue)")
+                log("Advertising via Bonjour (\(OTA.serviceType))")
+                log("Waiting for auth requests...")
             }
         }
 
@@ -250,7 +266,7 @@ private final class Server: @unchecked Sendable {
             do {
                 length = try Frame.readLength(from: data)
             } catch {
-                fputs("  frame error: \(error.localizedDescription)\n", stderr)
+                logErr("  frame error: \(error.localizedDescription)")
                 conn.cancel()
                 return
             }
@@ -284,7 +300,7 @@ private final class Server: @unchecked Sendable {
         // [M1] Rate limiting per source
         guard rateLimiter.shouldAllow(source: source) else {
             auditLog("RATE_LIMITED source=\(source)")
-            fputs("  rate limited: \(source)\n", stderr)
+            logErr("  rate limited: \(source)")
             reply(.init(approved: false, error: "Rate limited"), on: conn)
             return
         }
@@ -299,7 +315,7 @@ private final class Server: @unchecked Sendable {
             }
             nonce = decoded
         } catch {
-            fputs("  bad request from \(source): \(error.localizedDescription)\n", stderr)
+            logErr("  bad request from \(source): \(error.localizedDescription)")
             auditLog("BAD_REQUEST source=\(source) error=\(error.localizedDescription)")
             // [L1] Generic error to client
             let clientError = (error as? OTAError)?.clientDescription ?? "Bad request"
@@ -309,7 +325,7 @@ private final class Server: @unchecked Sendable {
 
         // [C2] Verify client PSK proof before showing Touch ID
         guard verifyClientProof(proof: req.clientProof, nonce: nonce, psk: psk) else {
-            fputs("  rejected (bad PSK) from \(source) [\(req.hostname)]\n", stderr)
+            logErr("  rejected (bad PSK) from \(source) [\(req.hostname)]")
             auditLog("AUTH_FAILED source=\(source) hostname=\(req.hostname) reason=bad_psk")
             reply(
                 .init(approved: false, error: OTAError.authenticationFailed.clientDescription),
@@ -319,7 +335,7 @@ private final class Server: @unchecked Sendable {
 
         // Test mode: PSK verified, skip Touch ID
         if req.mode == "test" {
-            print("\n[\(source)] test request (client hostname: \(req.hostname)) — OK")
+            log("[\(source)] test request (client hostname: \(req.hostname)) — OK")
             auditLog("TEST_OK source=\(source) hostname=\(req.hostname)")
             reply(.init(approved: true), on: conn)
             return
@@ -327,7 +343,7 @@ private final class Server: @unchecked Sendable {
 
         // [C3/M5] Fixed reason with source IP — never use client-supplied text in Touch ID prompt
         let displayReason = "OTA Touch ID request from \(source)"
-        print("\n[\(source)] auth request (client hostname: \(req.hostname))")
+        log("[\(source)] auth request (client hostname: \(req.hostname))")
 
         Task {
             do {
@@ -338,7 +354,7 @@ private final class Server: @unchecked Sendable {
                     keyBlob: keyBlob,
                     reason: displayReason
                 )
-                print("  approved")
+                log("  approved")
                 auditLog("APPROVED source=\(source) hostname=\(req.hostname)")
                 // [H3] Only send public key when client doesn't already have it
                 let pubKey: Data? = req.hasStoredKey ? nil : publicKeyRaw
@@ -346,7 +362,7 @@ private final class Server: @unchecked Sendable {
                     .init(approved: true, signature: sig.rawRepresentation, publicKey: pubKey),
                     on: conn)
             } catch {
-                print("  denied (\(error.localizedDescription))")
+                log("  denied (\(error.localizedDescription))")
                 auditLog(
                     "DENIED source=\(source) hostname=\(req.hostname) error=\(error.localizedDescription)"
                 )
@@ -361,7 +377,7 @@ private final class Server: @unchecked Sendable {
             let frame = try Frame.encode(response)
             conn.send(content: frame, completion: .contentProcessed { _ in conn.cancel() })
         } catch {
-            fputs("  encode error: \(error.localizedDescription)\n", stderr)
+            logErr("  encode error: \(error.localizedDescription)")
             conn.cancel()
         }
     }

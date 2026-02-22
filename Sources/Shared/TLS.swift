@@ -98,7 +98,8 @@ private func createEphemeralIdentity() throws -> (sec_identity_t, Data) {
     let certDER = try SelfSignedCert.build(publicKeyX963: pubData, signWith: privateKey)
 
     guard let cert = SecCertificateCreateWithData(nil, certDER as CFData) else {
-        throw OTAError.keyGenerationFailed("invalid certificate DER")
+        throw OTAError.keyGenerationFailed(
+            "invalid certificate DER (\(certDER.count) bytes, pub \(pubData.count) bytes)")
     }
 
     // 3. Add certificate to keychain so the system can link it to the private key
@@ -159,6 +160,9 @@ private enum SelfSignedCert {
     // -- TBS (To-Be-Signed) Certificate --
 
     private static func tbsCertificate(publicKeyX963: [UInt8]) -> [UInt8] {
+        // Explicit version field — technically optional for v1 per DER rules,
+        // but newer macOS versions reject certificates without it.
+        let version = DER.contextTag(0, DER.integer([0x00]))  // [0] EXPLICIT v1
         let serial = DER.integer([0x01])
         let issuer = rdnSequence("OTA Touch ID")
         let validity = DER.sequence(
@@ -169,7 +173,7 @@ private enum SelfSignedCert {
                 DER.oid(OID.ecPublicKey) + DER.oid(OID.prime256v1)
             ) + DER.bitString(publicKeyX963)
         )
-        return serial + ecdsaSHA256OID + issuer + validity + issuer + spki
+        return version + serial + ecdsaSHA256OID + issuer + validity + issuer + spki
     }
 
     private static func rdnSequence(_ cn: String) -> [UInt8] {
@@ -187,6 +191,7 @@ private enum SelfSignedCert {
 // MARK: - ASN.1 DER Encoding
 
 private enum DER {
+    static func contextTag(_ tag: UInt8, _ c: [UInt8]) -> [UInt8] { tlv(0xA0 | tag, c) }
     static func sequence(_ c: [UInt8]) -> [UInt8] { tlv(0x30, c) }
     static func set(_ c: [UInt8]) -> [UInt8] { tlv(0x31, c) }
     static func integer(_ b: [UInt8]) -> [UInt8] { tlv(0x02, b) }
