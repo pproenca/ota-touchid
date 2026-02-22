@@ -37,6 +37,73 @@ struct CLISmokeTests {
         #expect(result.status == 1)
         #expect(result.stderr.contains("Unknown option"))
     }
+
+    @Test("pair command rejects invalid PSK values")
+    func pairRejectsInvalidPSK() throws {
+        let result = try runCLI(["pair", "not-base64"])
+        #expect(result.status == 1)
+        #expect(result.stderr.contains("invalid PSK"))
+    }
+
+    @Test("pair command requires a PSK argument")
+    func pairRequiresArgument() throws {
+        let result = try runCLI(["pair"])
+        #expect(result.status == 1)
+        #expect(result.stderr.contains("Usage: ota-touchid pair"))
+    }
+
+    @Test("status runs without crashing on fresh home dir")
+    func statusOnFreshHome() throws {
+        let result = try runCLI(["status"])
+        #expect(result.status == 0)
+        #expect(result.stdout.contains("OTA Touch ID Status"))
+        #expect(result.stdout.contains("not found") || result.stdout.contains("present"))
+    }
+
+    @Test("test requires host and port together (host only)")
+    func testRequiresHostPortPair() throws {
+        let result = try runCLI(["test", "--host", "127.0.0.1"])
+        #expect(result.status == 1)
+        #expect(result.stderr.contains("--host and --port must be used together"))
+    }
+
+    @Test("auth rejects unknown flags")
+    func authRejectsUnknownFlag() throws {
+        let result = try runCLI(["auth", "--nope"])
+        #expect(result.status == 1)
+        #expect(result.stderr.contains("Unknown option"))
+    }
+
+    @Test("test rejects unknown flags")
+    func testRejectsUnknownFlag() throws {
+        let result = try runCLI(["test", "--nope"])
+        #expect(result.status == 1)
+        #expect(result.stderr.contains("Unknown option"))
+    }
+
+    @Test("help shows all commands")
+    func helpShowsAllCommands() throws {
+        let result = try runCLI(["help"])
+        #expect(result.stdout.contains("setup"))
+        #expect(result.stdout.contains("test"))
+        #expect(result.stdout.contains("auth"))
+        #expect(result.stdout.contains("status"))
+        #expect(result.stdout.contains("uninstall"))
+    }
+
+    @Test("--help flag works like help command")
+    func dashDashHelp() throws {
+        let result = try runCLI(["--help"])
+        #expect(result.status == 0)
+        #expect(result.stdout.contains("Usage:"))
+    }
+
+    @Test("-h flag works like help command")
+    func dashH() throws {
+        let result = try runCLI(["-h"])
+        #expect(result.status == 0)
+        #expect(result.stdout.contains("Usage:"))
+    }
 }
 
 private struct CLIResult {
