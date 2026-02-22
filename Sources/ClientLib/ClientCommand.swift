@@ -201,8 +201,7 @@ private func loadPSK() throws -> SymmetricKey? {
 }
 
 private func computeClientProof(psk: SymmetricKey, nonce: Data) -> Data {
-    let mac = HMAC<SHA256>.authenticationCode(for: nonce, using: psk)
-    return Data(mac)
+    AuthProof.compute(psk: psk, nonce: nonce)
 }
 
 // MARK: - Bonjour Discovery

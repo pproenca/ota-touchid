@@ -38,5 +38,9 @@ let package = Package(
             name: "SharedTests",
             dependencies: ["Shared"]
         ),
+        .testTarget(
+            name: "CLIIntegrationTests",
+            dependencies: ["CLI"]
+        ),
     ]
 )

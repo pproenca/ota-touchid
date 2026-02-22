@@ -149,10 +149,20 @@ private enum SelfSignedCert {
             throw cfError!.takeRetainedValue()
         }
 
+        return build(tbsData: [UInt8](tbsData), signatureDER: [UInt8](sig))
+    }
+
+    static func build(publicKeyX963: [UInt8], signatureDER: [UInt8]) -> Data {
+        let tbs = tbsCertificate(publicKeyX963: publicKeyX963)
+        let tbsData = DER.sequence(tbs)
+        return build(tbsData: tbsData, signatureDER: signatureDER)
+    }
+
+    private static func build(tbsData: [UInt8], signatureDER: [UInt8]) -> Data {
         let full = DER.sequence(
-            [UInt8](tbsData)
+            tbsData
                 + ecdsaSHA256OID
-                + DER.bitString([UInt8](sig))
+                + DER.bitString(signatureDER)
         )
         return Data(full)
     }
@@ -193,6 +203,13 @@ private enum SelfSignedCert {
     private static let ecdsaSHA256OID: [UInt8] = DER.sequence(
         DER.oid(OID.ecdsaWithSHA256)
     )
+}
+
+/// Test seam for deterministic certificate-shape checks without keychain or Secure Enclave.
+func buildSelfSignedCertDERForTesting(publicKeyX963: Data) -> Data {
+    // Minimal ASN.1 ECDSA-Sig-Value: SEQUENCE { INTEGER 1, INTEGER 1 }.
+    let fakeSignatureDER: [UInt8] = [0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01]
+    return SelfSignedCert.build(publicKeyX963: [UInt8](publicKeyX963), signatureDER: fakeSignatureDER)
 }
 
 // MARK: - ASN.1 DER Encoding

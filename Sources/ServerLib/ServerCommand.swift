@@ -149,9 +149,7 @@ private func loadOrCreatePSK() throws -> SymmetricKey {
 }
 
 private func verifyClientProof(proof: String?, nonce: Data, psk: SymmetricKey) -> Bool {
-    guard let proof, let proofData = Data(base64Encoded: proof) else { return false }
-    let expected = HMAC<SHA256>.authenticationCode(for: nonce, using: psk)
-    return proofData == Data(expected)
+    AuthProof.verify(proofBase64: proof, nonce: nonce, psk: psk)
 }
 
 // MARK: - Audit Logging [L2]
@@ -192,29 +190,6 @@ private func sign(data: Data, keyBlob: Data, reason: String) async throws
     return try key.signature(for: data)
 }
 
-// MARK: - Rate Limiting [M1]
-
-private final class RateLimiter {
-    private var attempts: [String: (count: Int, resetTime: Date)] = [:]
-    private let maxAttempts = 5
-    private let windowSeconds: TimeInterval = 60
-
-    func shouldAllow(source: String) -> Bool {
-        let now = Date()
-        if let entry = attempts[source] {
-            if now >= entry.resetTime {
-                attempts[source] = (count: 1, resetTime: now.addingTimeInterval(windowSeconds))
-                return true
-            }
-            if entry.count >= maxAttempts { return false }
-            attempts[source] = (count: entry.count + 1, resetTime: entry.resetTime)
-            return true
-        }
-        attempts[source] = (count: 1, resetTime: now.addingTimeInterval(windowSeconds))
-        return true
-    }
-}
-
 // MARK: - Server
 
 /// All NWListener/NWConnection callbacks are dispatched to `.main`,
@@ -225,7 +200,7 @@ private final class Server: @unchecked Sendable {
     let publicKeyRaw: Data
     let psk: SymmetricKey
     let certFingerprint: Data  // [M2] TLS cert SHA-256 for channel binding
-    let rateLimiter = RateLimiter()
+    let rateLimiter = SourceRateLimiter()
 
     init(
         keyBlob: Data, publicKeyRaw: Data, psk: SymmetricKey, certFingerprint: Data,
