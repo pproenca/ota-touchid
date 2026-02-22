@@ -160,9 +160,9 @@ private enum SelfSignedCert {
     // -- TBS (To-Be-Signed) Certificate --
 
     private static func tbsCertificate(publicKeyX963: [UInt8]) -> [UInt8] {
-        // Explicit version field — technically optional for v1 per DER rules,
-        // but newer macOS versions reject certificates without it.
-        let version = DER.contextTag(0, DER.integer([0x00]))  // [0] EXPLICIT v1
+        // DER forbids encoding DEFAULT values, so explicit v1 (0) is non-canonical.
+        // Use explicit v3 (2) for broad compatibility with strict parsers.
+        let version = DER.contextTag(0, DER.integer([0x02]))  // [0] EXPLICIT v3
         let serial = DER.integer([0x01])
         let issuer = rdnSequence("OTA Touch ID")
         let validity = DER.sequence(
@@ -173,7 +173,14 @@ private enum SelfSignedCert {
                 DER.oid(OID.ecPublicKey) + DER.oid(OID.prime256v1)
             ) + DER.bitString(publicKeyX963)
         )
-        return version + serial + ecdsaSHA256OID + issuer + validity + issuer + spki
+        // v3 requires at least one extension (RFC 5280 §4.1.2.9).
+        let basicConstraints = DER.sequence(
+            DER.oid(OID.basicConstraints)
+                + DER.boolean(true)
+                + DER.octetString(DER.sequence([]))
+        )
+        let extensions = DER.contextTag(3, DER.sequence(basicConstraints))
+        return version + serial + ecdsaSHA256OID + issuer + validity + issuer + spki + extensions
     }
 
     private static func rdnSequence(_ cn: String) -> [UInt8] {
@@ -195,7 +202,9 @@ private enum DER {
     static func sequence(_ c: [UInt8]) -> [UInt8] { tlv(0x30, c) }
     static func set(_ c: [UInt8]) -> [UInt8] { tlv(0x31, c) }
     static func integer(_ b: [UInt8]) -> [UInt8] { tlv(0x02, b) }
+    static func boolean(_ v: Bool) -> [UInt8] { tlv(0x01, [v ? 0xFF : 0x00]) }
     static func bitString(_ b: [UInt8]) -> [UInt8] { tlv(0x03, [0x00] + b) }
+    static func octetString(_ b: [UInt8]) -> [UInt8] { tlv(0x04, b) }
     static func oid(_ b: [UInt8]) -> [UInt8] { tlv(0x06, b) }
     static func utf8String(_ s: String) -> [UInt8] { tlv(0x0C, [UInt8](s.utf8)) }
     static func utcTime(_ s: String) -> [UInt8] { tlv(0x17, [UInt8](s.utf8)) }
@@ -223,4 +232,5 @@ private enum OID {
     static let ecPublicKey: [UInt8] = [0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01]
     static let prime256v1: [UInt8] = [0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07]
     static let ecdsaWithSHA256: [UInt8] = [0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02]
+    static let basicConstraints: [UInt8] = [0x55, 0x1D, 0x13]  // 2.5.29.19
 }
