@@ -58,13 +58,16 @@ public enum TLSConfig {
 // MARK: - Ephemeral Identity
 
 private let keychainLabel = "com.ota-touchid.tls-ephemeral"
+private let certCN = "OTA Touch ID"
 
 /// Creates an ephemeral TLS identity and returns it along with the raw DER certificate.
 private func createEphemeralIdentity() throws -> (sec_identity_t, Data) {
-    // Clean up previous run's artifacts
-    for cls in [kSecClassKey, kSecClassCertificate, kSecClassIdentity] {
+    // Clean up previous run's artifacts.
+    // Note: Keychain auto-sets certificate labels to the Subject CN, not our custom label.
+    for cls in [kSecClassKey, kSecClassIdentity] {
         SecItemDelete([kSecClass: cls, kSecAttrLabel: keychainLabel] as CFDictionary)
     }
+    SecItemDelete([kSecClass: kSecClassCertificate, kSecAttrLabel: certCN] as CFDictionary)
 
     // 1. Generate ephemeral P-256 key pair in the Keychain
     let keyTag = keychainLabel.data(using: .utf8)!
@@ -144,7 +147,7 @@ private enum SelfSignedCert {
         }
 
         let full = DER.sequence(
-            tbs
+            [UInt8](tbsData)
                 + ecdsaSHA256OID
                 + DER.bitString([UInt8](sig))
         )

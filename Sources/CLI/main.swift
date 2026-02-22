@@ -231,11 +231,11 @@ enum SetupCommand {
 
     private static func resolveRealBinaryPath() -> String? {
         let arg0 = CommandLine.arguments[0]
-        // If it's already absolute, resolve symlinks
+        // If it's already absolute, resolve symlinks to an absolute path
         if arg0.hasPrefix("/") {
-            return (try? FileManager.default.destinationOfSymbolicLink(atPath: arg0)) ?? arg0
+            return URL(fileURLWithPath: arg0).resolvingSymlinksInPath().path
         }
-        // Try to find via `which`
+        // Try to find via `which`, then resolve symlinks
         let which = Process()
         which.executableURL = URL(fileURLWithPath: "/usr/bin/which")
         which.arguments = ["ota-touchid"]
@@ -246,7 +246,7 @@ enum SetupCommand {
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         let path = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let path, !path.isEmpty else { return nil }
-        return path
+        return URL(fileURLWithPath: path).resolvingSymlinksInPath().path
     }
 
     private static func launchdPlist(binaryPath: String) -> String {
