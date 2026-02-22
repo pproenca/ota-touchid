@@ -16,13 +16,21 @@ struct RequestValidationTests {
         mode: String? = nil
     ) throws -> Data {
         let key = psk ?? self.psk
-        let proof = AuthProof.compute(psk: key, nonce: nonce)
+        let normalizedMode = mode ?? "auth"
+        let proof = AuthProof.computeRequestMAC(
+            psk: key,
+            mode: normalizedMode,
+            nonce: nonce,
+            reason: reason,
+            hostname: ProcessInfo.processInfo.hostName,
+            hasStoredKey: hasStoredKey
+        )
         let req = AuthRequest(
+            mode: normalizedMode,
             nonce: nonce,
             reason: reason,
             hasStoredKey: hasStoredKey,
-            clientProof: proof,
-            mode: mode
+            requestMAC: proof
         )
         let frame = try Frame.encode(req)
         return Data(frame.suffix(from: 4))
@@ -35,7 +43,7 @@ struct RequestValidationTests {
         let limiter = SourceRateLimiter()
         let result = try validateAuthRequest(payload: payload, psk: psk, rateLimiter: limiter, source: "10.0.0.1:5000")
 
-        if case .auth(let n, _, let hasKey, let src) = result {
+        if case .auth(let n, _, _, let hasKey, let src) = result {
             #expect(n == nonce)
             #expect(hasKey == false)
             #expect(src == "10.0.0.1:5000")
@@ -82,8 +90,15 @@ struct RequestValidationTests {
     @Test("rejects invalid nonce (wrong size)")
     func rejectsShortNonce() throws {
         let shortNonce = Data(repeating: 0xAA, count: 16)
-        let proof = AuthProof.compute(psk: psk, nonce: shortNonce)
-        let req = AuthRequest(nonce: shortNonce, reason: "test", clientProof: proof)
+        let proof = AuthProof.computeRequestMAC(
+            psk: psk,
+            mode: "auth",
+            nonce: shortNonce,
+            reason: "test",
+            hostname: ProcessInfo.processInfo.hostName,
+            hasStoredKey: false
+        )
+        let req = AuthRequest(mode: "auth", nonce: shortNonce, reason: "test", requestMAC: proof)
         let frame = try Frame.encode(req)
         let payload = Data(frame.suffix(from: 4))
         let limiter = SourceRateLimiter()
@@ -107,7 +122,7 @@ struct RequestValidationTests {
     @Test("rejects request with nil proof")
     func rejectsNilProof() throws {
         let nonce = Data(repeating: 0xAA, count: OTA.nonceSize)
-        let req = AuthRequest(nonce: nonce, reason: "test")
+        let req = AuthRequest(mode: "auth", nonce: nonce, reason: "test")
         let frame = try Frame.encode(req)
         let payload = Data(frame.suffix(from: 4))
         let limiter = SourceRateLimiter()
@@ -123,7 +138,7 @@ struct RequestValidationTests {
         let limiter = SourceRateLimiter()
         let result = try validateAuthRequest(payload: payload, psk: psk, rateLimiter: limiter, source: "x")
 
-        if case .auth(_, _, let hasKey, _) = result {
+        if case .auth(_, _, _, let hasKey, _) = result {
             #expect(hasKey == true)
         } else {
             Issue.record("Expected .auth")

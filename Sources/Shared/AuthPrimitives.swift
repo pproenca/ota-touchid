@@ -1,40 +1,144 @@
 import CryptoKit
 import Foundation
 
-// MARK: - PSK Proof (HMAC-SHA256)
+// MARK: - Protocol v2 transcript auth (HMAC-SHA256)
 
 public enum AuthProof {
-    private static let testProofContext = Data("ota-touchid:test-proof:v1".utf8)
+    private static let requestContext = Data("ota-touchid:req:v2".utf8)
+    private static let responseContext = Data("ota-touchid:resp:v2".utf8)
+    private static let authSignatureContext = Data("ota-touchid:authsig:v2".utf8)
 
-    public static func compute(psk: SymmetricKey, nonce: Data) -> Data {
-        let mac = HMAC<SHA256>.authenticationCode(for: nonce, using: psk)
-        return Data(mac)
-    }
-
-    public static func verify(proofBase64: String?, nonce: Data, psk: SymmetricKey) -> Bool {
-        guard let proofBase64, let proofData = Data(base64Encoded: proofBase64) else { return false }
-        return constantTimeEqual(proofData, compute(psk: psk, nonce: nonce))
-    }
-
-    /// Server-to-client proof used for `test` mode.
-    /// Binds to the same nonce and negotiated TLS peer certificate fingerprint.
-    public static func computeTestServerProof(
-        psk: SymmetricKey, nonce: Data, certFingerprint: Data
+    public static func computeRequestMAC(
+        psk: SymmetricKey,
+        mode: String,
+        nonce: Data,
+        reason: String,
+        hostname: String,
+        hasStoredKey: Bool
     ) -> Data {
-        let payload = testProofContext + nonce + certFingerprint
+        let payload = transcript(
+            context: requestContext,
+            fields: [
+                Data(mode.utf8),
+                nonce,
+                digest(reason),
+                digest(hostname),
+                Data([hasStoredKey ? 1 : 0]),
+            ]
+        )
         let mac = HMAC<SHA256>.authenticationCode(for: payload, using: psk)
         return Data(mac)
     }
 
-    public static func verifyTestServerProof(
+    public static func verifyRequestMAC(
         proofBase64: String?,
         psk: SymmetricKey,
+        mode: String,
         nonce: Data,
+        reason: String,
+        hostname: String,
+        hasStoredKey: Bool
+    ) -> Bool {
+        guard let proofBase64, let proofData = Data(base64Encoded: proofBase64) else { return false }
+        let expected = computeRequestMAC(
+            psk: psk,
+            mode: mode,
+            nonce: nonce,
+            reason: reason,
+            hostname: hostname,
+            hasStoredKey: hasStoredKey
+        )
+        return constantTimeEqual(proofData, expected)
+    }
+
+    public static func computeResponseMAC(
+        psk: SymmetricKey,
+        mode: String,
+        nonceC: Data,
+        nonceS: Data,
+        approved: Bool,
+        signature: Data?,
+        error: String?,
+        certFingerprint: Data
+    ) -> Data {
+        let payload = transcript(
+            context: responseContext,
+            fields: [
+                Data(mode.utf8),
+                nonceC,
+                nonceS,
+                Data([approved ? 1 : 0]),
+                digest(signature ?? Data()),
+                digest(Data((error ?? "").utf8)),
+                certFingerprint,
+            ]
+        )
+        let mac = HMAC<SHA256>.authenticationCode(for: payload, using: psk)
+        return Data(mac)
+    }
+
+    public static func verifyResponseMAC(
+        proofBase64: String?,
+        psk: SymmetricKey,
+        mode: String,
+        nonceC: Data,
+        nonceS: Data,
+        approved: Bool,
+        signature: Data?,
+        error: String?,
         certFingerprint: Data
     ) -> Bool {
         guard let proofBase64, let proofData = Data(base64Encoded: proofBase64) else { return false }
-        let expected = computeTestServerProof(psk: psk, nonce: nonce, certFingerprint: certFingerprint)
+        let expected = computeResponseMAC(
+            psk: psk,
+            mode: mode,
+            nonceC: nonceC,
+            nonceS: nonceS,
+            approved: approved,
+            signature: signature,
+            error: error,
+            certFingerprint: certFingerprint
+        )
         return constantTimeEqual(proofData, expected)
+    }
+
+    /// Transcript that the server signs via Secure Enclave in auth mode.
+    public static func authSignaturePayload(
+        nonceC: Data,
+        nonceS: Data,
+        approved: Bool,
+        reason: String,
+        certFingerprint: Data
+    ) -> Data {
+        transcript(
+            context: authSignatureContext,
+            fields: [
+                Data("auth".utf8),
+                nonceC,
+                nonceS,
+                Data([approved ? 1 : 0]),
+                digest(reason),
+                certFingerprint,
+            ]
+        )
+    }
+
+    private static func transcript(context: Data, fields: [Data]) -> Data {
+        var data = context
+        for field in fields {
+            var len = UInt32(field.count).bigEndian
+            data.append(Data(bytes: &len, count: 4))
+            data.append(field)
+        }
+        return data
+    }
+
+    private static func digest(_ string: String) -> Data {
+        digest(Data(string.utf8))
+    }
+
+    private static func digest(_ data: Data) -> Data {
+        Data(SHA256.hash(data: data))
     }
 
     private static func constantTimeEqual(_ lhs: Data, _ rhs: Data) -> Bool {

@@ -22,8 +22,9 @@ struct FrameTests {
         #expect(Data(base64Encoded: decoded.nonce) == nonce)
         #expect(decoded.version == OTA.protocolVersion)
         #expect(decoded.hasStoredKey == false)
+        #expect(decoded.requestMAC == nil)
         #expect(decoded.clientProof == nil)
-        #expect(decoded.mode == nil)
+        #expect(decoded.mode == "auth")
     }
 
     @Test("Round-trip AuthRequest with all fields")
@@ -31,23 +32,38 @@ struct FrameTests {
         let nonce = Data(repeating: 0xAB, count: OTA.nonceSize)
         let proof = Data(repeating: 0x01, count: 32)
         let original = AuthRequest(
-            nonce: nonce, reason: "sudo", hasStoredKey: true, clientProof: proof)
+            mode: "auth",
+            nonce: nonce,
+            reason: "sudo",
+            hasStoredKey: true,
+            requestMAC: proof
+        )
         let encoded = try Frame.encode(original)
         let payload = encoded.suffix(from: 4)
         let decoded = try Frame.decode(AuthRequest.self, from: Data(payload))
 
         #expect(decoded.hasStoredKey == true)
-        #expect(decoded.clientProof != nil)
-        #expect(Data(base64Encoded: decoded.clientProof!) == proof)
+        #expect(decoded.requestMAC != nil)
+        #expect(Data(base64Encoded: decoded.requestMAC!) == proof)
+        #expect(decoded.clientProof == nil)
         #expect(decoded.version == OTA.protocolVersion)
-        #expect(decoded.mode == nil)
+        #expect(decoded.mode == "auth")
     }
 
     @Test("Round-trip encode/decode preserves AuthResponse")
     func roundTripAuthResponse() throws {
         let sig = Data(repeating: 0xCD, count: 64)
         let pub = Data(repeating: 0xEF, count: 65)
-        let original = AuthResponse(approved: true, signature: sig, publicKey: pub)
+        let nonceS = Data(repeating: 0x22, count: OTA.nonceSize)
+        let mac = Data(repeating: 0x33, count: 32)
+        let original = AuthResponse(
+            mode: "auth",
+            approved: true,
+            nonceS: nonceS,
+            signature: sig,
+            publicKey: pub,
+            responseMAC: mac
+        )
         let encoded = try Frame.encode(original)
 
         let length = try Frame.readLength(from: encoded.prefix(4))
@@ -55,8 +71,11 @@ struct FrameTests {
         let decoded = try Frame.decode(AuthResponse.self, from: Data(payload))
 
         #expect(decoded.approved == true)
+        #expect(decoded.mode == "auth")
+        #expect(Data(base64Encoded: decoded.nonceS!) == nonceS)
         #expect(Data(base64Encoded: decoded.signature!) == sig)
         #expect(Data(base64Encoded: decoded.publicKey!) == pub)
+        #expect(Data(base64Encoded: decoded.responseMAC!) == mac)
         #expect(decoded.testProof == nil)
         #expect(decoded.version == OTA.protocolVersion)
         #expect(length == payload.count)
@@ -99,6 +118,7 @@ struct FrameTests {
         #expect(decoded.approved == false)
         #expect(decoded.signature == nil)
         #expect(decoded.publicKey == nil)
+        #expect(decoded.responseMAC == nil)
         #expect(decoded.testProof == nil)
         #expect(decoded.error == "biometry cancelled")
         #expect(decoded.version == OTA.protocolVersion)
@@ -115,6 +135,7 @@ struct FrameTests {
         #expect(decoded.approved == true)
         #expect(decoded.publicKey == nil)
         #expect(decoded.signature != nil)
+        #expect(decoded.responseMAC == nil)
         #expect(decoded.testProof == nil)
     }
 
@@ -123,7 +144,7 @@ struct FrameTests {
         let nonce = Data(repeating: 0xCC, count: OTA.nonceSize)
         let proof = Data(repeating: 0x02, count: 32)
         let original = AuthRequest(
-            nonce: nonce, reason: "test", hasStoredKey: true, clientProof: proof, mode: "test")
+            mode: "test", nonce: nonce, reason: "test", hasStoredKey: true, requestMAC: proof)
         let encoded = try Frame.encode(original)
         let payload = encoded.suffix(from: 4)
         let decoded = try Frame.decode(AuthRequest.self, from: Data(payload))
@@ -131,7 +152,7 @@ struct FrameTests {
         #expect(decoded.mode == "test")
         #expect(decoded.reason == "test")
         #expect(decoded.hasStoredKey == true)
-        #expect(decoded.clientProof != nil)
+        #expect(decoded.requestMAC != nil)
     }
 
     @Test("Backward compat: decode JSON without mode key yields nil")
@@ -213,7 +234,7 @@ struct ConstantsTests {
 
     @Test("Protocol version is set")
     func protocolVersion() {
-        #expect(OTA.protocolVersion >= 1)
+        #expect(OTA.protocolVersion == 2)
     }
 
     @Test("PSK file is under config dir")
@@ -236,6 +257,7 @@ struct ErrorTests {
             .timeout,
             .frameTooLarge(999),
             .signatureVerificationFailed,
+            .responseVerificationFailed,
             .testProofVerificationFailed,
             .serverKeyNotTrusted,
             .invalidPort("abc"),
@@ -263,6 +285,7 @@ struct ErrorTests {
         #expect(OTAError.shortRead.clientDescription == "Request denied")
         #expect(OTAError.timeout.clientDescription == "Request denied")
         #expect(OTAError.signatureVerificationFailed.clientDescription == "Request denied")
+        #expect(OTAError.responseVerificationFailed.clientDescription == "Request denied")
         #expect(OTAError.testProofVerificationFailed.clientDescription == "Request denied")
         #expect(OTAError.serverKeyNotTrusted.clientDescription == "Request denied")
         #expect(OTAError.invalidPort("abc").clientDescription == "Request denied")
@@ -291,17 +314,25 @@ struct MessageTests {
         #expect(req.reason == "sudo")
         #expect(req.hostname == ProcessInfo.processInfo.hostName)
         #expect(req.hasStoredKey == false)
+        #expect(req.requestMAC == nil)
         #expect(req.clientProof == nil)
-        #expect(req.mode == nil)
+        #expect(req.mode == "auth")
     }
 
     @Test("AuthRequest with all optional fields")
     func authRequestFull() {
         let nonce = Data(repeating: 0xAA, count: 32)
         let proof = Data(repeating: 0xBB, count: 32)
-        let req = AuthRequest(nonce: nonce, reason: "test", hasStoredKey: true, clientProof: proof, mode: "test")
+        let req = AuthRequest(
+            mode: "test",
+            nonce: nonce,
+            reason: "test",
+            hasStoredKey: true,
+            requestMAC: proof
+        )
         #expect(req.hasStoredKey == true)
-        #expect(req.clientProof == proof.base64EncodedString())
+        #expect(req.requestMAC == proof.base64EncodedString())
+        #expect(req.clientProof == nil)
         #expect(req.mode == "test")
     }
 
@@ -314,6 +345,7 @@ struct MessageTests {
         #expect(resp.approved == true)
         #expect(resp.signature == sig.base64EncodedString())
         #expect(resp.publicKey == pub.base64EncodedString())
+        #expect(resp.responseMAC == nil)
         #expect(resp.testProof == nil)
         #expect(resp.error == nil)
     }
@@ -324,6 +356,7 @@ struct MessageTests {
         #expect(resp.approved == false)
         #expect(resp.signature == nil)
         #expect(resp.publicKey == nil)
+        #expect(resp.responseMAC == nil)
         #expect(resp.testProof == nil)
         #expect(resp.error == "denied by user")
     }
@@ -334,6 +367,7 @@ struct MessageTests {
         #expect(resp.approved == true)
         #expect(resp.signature == nil)
         #expect(resp.publicKey == nil)
+        #expect(resp.responseMAC == nil)
         #expect(resp.testProof == nil)
         #expect(resp.error == nil)
     }

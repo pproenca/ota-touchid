@@ -11,23 +11,14 @@ public enum ClientCommand {
     public static func auth(reason: String, host: String?, port: UInt16?, allowTOFU: Bool = false) -> Never {
         Task {
             do {
-                let endpoint: NWEndpoint
-                if let host, let port {
-                    endpoint = NWEndpoint.hostPort(
-                        host: NWEndpoint.Host(host),
-                        port: NWEndpoint.Port(rawValue: port)!
-                    )
-                } else {
-                    fputs("Discovering server via Bonjour...\n", stderr)
-                    endpoint = try await discover()
-                    fputs("Found server: \(endpoint)\n", stderr)
-                }
+                let endpoint = try await resolveEndpoint(host: host, port: port)
 
                 let approved = try await requestAuth(
                     endpoint: endpoint,
                     reason: reason,
                     allowTOFU: allowTOFU
                 )
+                saveEndpointHint(from: endpoint)
                 exit(approved ? 0 : 1)
             } catch OTAError.authenticationFailed {
                 fputs(
@@ -70,6 +61,23 @@ public enum ClientCommand {
         print("PSK saved to \(OTA.pskFile.path)")
     }
 
+    /// Import either a raw PSK or a signed pairing bundle token.
+    public static func pairInput(_ input: String) throws {
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.hasPrefix(PairingBundle.prefix) {
+            let bundle = try PairingBundle.decodeToken(trimmed)
+            try pair(pskBase64: bundle.pskBase64)
+            try trustKey(base64: bundle.serverPublicKeyBase64)
+            if let endpointHint = bundle.endpointHint {
+                try storeEndpointHint(endpointHint)
+                print("Server endpoint hint saved (\(endpointHint.host):\(endpointHint.port)).")
+            }
+            print("Pairing bundle imported.")
+            return
+        }
+        try pair(pskBase64: trimmed)
+    }
+
     /// Manually trust a server public key.
     public static func trustKey(base64: String) throws {
         try storePublicKey(base64)
@@ -84,10 +92,15 @@ public enum ClientCommand {
                 print("Trusted server key: \(key.rawRepresentation.base64EncodedString())")
                 print("Fingerprint: \(fp)")
             } else {
-                print("No trusted server key. Will use TOFU on first connection.")
+                print("No trusted server key configured.")
             }
         } catch {
             print("Error reading server key: \(error.localizedDescription)")
+        }
+        if let hint = loadEndpointHint() {
+            print("Endpoint hint: \(hint.host):\(hint.port)")
+        } else {
+            print("Endpoint hint: not set")
         }
         let hasPSK = (try? loadPSK()) != nil
         print("PSK: \(hasPSK ? "configured" : "NOT configured (required)")")
@@ -95,6 +108,11 @@ public enum ClientCommand {
 
     /// Set up client: try iCloud Keychain first, fall back to manual PSK entry.
     public static func setupClient(pskBase64: String?) throws {
+        if let pskBase64, pskBase64.hasPrefix(PairingBundle.prefix) {
+            try pairInput(pskBase64)
+            return
+        }
+
         var psk = pskBase64
 
         // Try iCloud Keychain if no PSK provided
@@ -119,7 +137,7 @@ public enum ClientCommand {
             psk = line
         }
 
-        try pair(pskBase64: psk!)
+        try pairInput(psk!)
 
         // Try to get public key from iCloud Keychain (eliminates TOFU)
         if let pubKeyData = SyncedKeychain.read(account: .serverPublicKey),
@@ -139,19 +157,10 @@ public enum ClientCommand {
     public static func test(host: String?, port: UInt16?) -> Never {
         Task {
             do {
-                let endpoint: NWEndpoint
-                if let host, let port {
-                    endpoint = NWEndpoint.hostPort(
-                        host: NWEndpoint.Host(host),
-                        port: NWEndpoint.Port(rawValue: port)!
-                    )
-                } else {
-                    fputs("Discovering server via Bonjour...\n", stderr)
-                    endpoint = try await discover()
-                    fputs("Found server: \(endpoint)\n", stderr)
-                }
+                let endpoint = try await resolveEndpoint(host: host, port: port)
 
                 let ok = try await requestTest(endpoint: endpoint)
+                saveEndpointHint(from: endpoint)
                 if ok {
                     print("Connection test passed.")
                     exit(0)
@@ -215,11 +224,43 @@ private func loadPSK() throws -> SymmetricKey? {
     return SymmetricKey(data: data)
 }
 
-private func computeClientProof(psk: SymmetricKey, nonce: Data) -> Data {
-    AuthProof.compute(psk: psk, nonce: nonce)
+private func randomNonce() throws -> Data {
+    var nonceBytes = [UInt8](repeating: 0, count: OTA.nonceSize)
+    guard SecRandomCopyBytes(kSecRandomDefault, OTA.nonceSize, &nonceBytes) == errSecSuccess else {
+        throw OTAError.keyGenerationFailed("SecRandomCopyBytes failed")
+    }
+    return Data(nonceBytes)
 }
 
-// MARK: - Bonjour Discovery
+// MARK: - Endpoint Resolution / Discovery
+
+private func resolveEndpoint(host: String?, port: UInt16?) async throws -> NWEndpoint {
+    if let host {
+        let resolvedPort = port ?? OTA.defaultPort
+        guard let nwPort = NWEndpoint.Port(rawValue: resolvedPort) else {
+            throw OTAError.invalidPort("\(resolvedPort)")
+        }
+        let endpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(host), port: nwPort)
+        fputs("Using direct endpoint: \(endpoint)\n", stderr)
+        return endpoint
+    }
+
+    fputs("Discovering server via Bonjour...\n", stderr)
+    do {
+        let endpoint = try await discover()
+        fputs("Found server: \(endpoint)\n", stderr)
+        return endpoint
+    } catch {
+        if let cached = loadCachedEndpoint() {
+            fputs(
+                "Discovery failed (\(error.localizedDescription)). Trying cached endpoint: \(cached)\n",
+                stderr
+            )
+            return cached
+        }
+        throw error
+    }
+}
 
 private func discover(timeout: TimeInterval = 5) async throws -> NWEndpoint {
     try await withCheckedThrowingContinuation { cont in
@@ -252,6 +293,41 @@ private func discover(timeout: TimeInterval = 5) async throws -> NWEndpoint {
     }
 }
 
+private func storeEndpointHint(_ hint: EndpointHint) throws {
+    let fm = FileManager.default
+    try fm.createDirectory(at: OTA.configDir, withIntermediateDirectories: true)
+    let data = try JSONEncoder().encode(hint)
+    let tmpFile = OTA.endpointFile.deletingLastPathComponent()
+        .appendingPathComponent(UUID().uuidString)
+    fm.createFile(
+        atPath: tmpFile.path,
+        contents: data,
+        attributes: [.posixPermissions: 0o600]
+    )
+    try? fm.removeItem(at: OTA.endpointFile)
+    try fm.moveItem(at: tmpFile, to: OTA.endpointFile)
+}
+
+private func saveEndpointHint(from endpoint: NWEndpoint) {
+    guard case .hostPort(let host, let port) = endpoint else { return }
+    try? storeEndpointHint(
+        EndpointHint(host: "\(host)", port: port.rawValue)
+    )
+}
+
+private func loadEndpointHint() -> EndpointHint? {
+    guard FileManager.default.fileExists(atPath: OTA.endpointFile.path) else { return nil }
+    guard let data = try? Data(contentsOf: OTA.endpointFile) else { return nil }
+    return try? JSONDecoder().decode(EndpointHint.self, from: data)
+}
+
+private func loadCachedEndpoint() -> NWEndpoint? {
+    guard let hint = loadEndpointHint(),
+          let port = NWEndpoint.Port(rawValue: hint.port)
+    else { return nil }
+    return .hostPort(host: NWEndpoint.Host(hint.host), port: port)
+}
+
 // MARK: - TOFU Confirmation [H1]
 
 private func confirmTOFU(fingerprint: String) -> Bool {
@@ -276,22 +352,25 @@ private func requestAuth(endpoint: NWEndpoint, reason: String, allowTOFU: Bool) 
     guard let psk = try loadPSK() else {
         throw OTAError.authenticationFailed
     }
-
-    // Generate cryptographic nonce
-    var nonceBytes = [UInt8](repeating: 0, count: OTA.nonceSize)
-    guard SecRandomCopyBytes(kSecRandomDefault, OTA.nonceSize, &nonceBytes) == errSecSuccess else {
-        throw OTAError.keyGenerationFailed("SecRandomCopyBytes failed")
-    }
-    let nonce = Data(nonceBytes)
+    let mode = "auth"
+    let nonceC = try randomNonce()
 
     let hasStoredKey = (try? loadPublicKey()) != nil
-    let proof = computeClientProof(psk: psk, nonce: nonce)
+    let requestMAC = AuthProof.computeRequestMAC(
+        psk: psk,
+        mode: mode,
+        nonce: nonceC,
+        reason: reason,
+        hostname: ProcessInfo.processInfo.hostName,
+        hasStoredKey: hasStoredKey
+    )
 
     let request = AuthRequest(
-        nonce: nonce,
+        mode: mode,
+        nonce: nonceC,
         reason: reason,
         hasStoredKey: hasStoredKey,
-        clientProof: proof
+        requestMAC: requestMAC
     )
     let frame = try Frame.encode(request)
 
@@ -302,24 +381,47 @@ private func requestAuth(endpoint: NWEndpoint, reason: String, allowTOFU: Bool) 
 
     try await asyncSend(frame, on: conn)
     let response: AuthResponse = try await asyncReadFrame(AuthResponse.self, on: conn)
+    guard let certFP = peerInfo.certFingerprint else {
+        throw OTAError.responseVerificationFailed
+    }
+    guard let nonceSBase64 = response.nonceS, let nonceS = Data(base64Encoded: nonceSBase64) else {
+        throw OTAError.responseVerificationFailed
+    }
+    let responseMode = response.mode ?? mode
+    guard responseMode == mode else {
+        throw OTAError.responseVerificationFailed
+    }
+    let signatureData = response.signature.flatMap { Data(base64Encoded: $0) }
+    let verifiedResponse = AuthProof.verifyResponseMAC(
+        proofBase64: response.responseMAC,
+        psk: psk,
+        mode: responseMode,
+        nonceC: nonceC,
+        nonceS: nonceS,
+        approved: response.approved,
+        signature: signatureData,
+        error: response.error,
+        certFingerprint: certFP
+    )
+    guard verifiedResponse else {
+        throw OTAError.responseVerificationFailed
+    }
 
-    guard response.approved,
-        let sigBase64 = response.signature,
-        let sigRaw = Data(base64Encoded: sigBase64)
-    else {
+    if !response.approved {
         fputs("Denied: \(response.error ?? "unknown")\n", stderr)
         return false
     }
-
-    let signature = try P256.Signing.ECDSASignature(rawRepresentation: sigRaw)
-
-    // [M2] Channel binding: verify signature over nonce + TLS cert fingerprint.
-    // A MITM with a different TLS certificate produces a different fingerprint,
-    // causing signature verification to fail even if they relay to the real server.
-    guard let certFP = peerInfo.certFingerprint else {
+    guard let sigRaw = signatureData else {
         throw OTAError.signatureVerificationFailed
     }
-    let signedData = nonce + certFP
+    let signature = try P256.Signing.ECDSASignature(rawRepresentation: sigRaw)
+    let signedData = AuthProof.authSignaturePayload(
+        nonceC: nonceC,
+        nonceS: nonceS,
+        approved: true,
+        reason: reason,
+        certFingerprint: certFP
+    )
 
     // Verify against stored key
     if let storedKey = try loadPublicKey() {
@@ -361,20 +463,24 @@ private func requestTest(endpoint: NWEndpoint) async throws -> Bool {
     guard let psk = try loadPSK() else {
         throw OTAError.authenticationFailed
     }
-
-    var nonceBytes = [UInt8](repeating: 0, count: OTA.nonceSize)
-    guard SecRandomCopyBytes(kSecRandomDefault, OTA.nonceSize, &nonceBytes) == errSecSuccess else {
-        throw OTAError.keyGenerationFailed("SecRandomCopyBytes failed")
-    }
-    let nonce = Data(nonceBytes)
-    let proof = computeClientProof(psk: psk, nonce: nonce)
+    let mode = "test"
+    let nonceC = try randomNonce()
+    let reason = "connectivity-test"
+    let requestMAC = AuthProof.computeRequestMAC(
+        psk: psk,
+        mode: mode,
+        nonce: nonceC,
+        reason: reason,
+        hostname: ProcessInfo.processInfo.hostName,
+        hasStoredKey: true
+    )
 
     let request = AuthRequest(
-        nonce: nonce,
-        reason: "test",
+        mode: mode,
+        nonce: nonceC,
+        reason: reason,
         hasStoredKey: true,
-        clientProof: proof,
-        mode: "test"
+        requestMAC: requestMAC
     )
     let frame = try Frame.encode(request)
 
@@ -384,23 +490,34 @@ private func requestTest(endpoint: NWEndpoint) async throws -> Bool {
 
     try await asyncSend(frame, on: conn)
     let response: AuthResponse = try await asyncReadFrame(AuthResponse.self, on: conn)
-
+    guard let certFP = peerInfo.certFingerprint else {
+        throw OTAError.responseVerificationFailed
+    }
+    guard let nonceSBase64 = response.nonceS, let nonceS = Data(base64Encoded: nonceSBase64) else {
+        throw OTAError.responseVerificationFailed
+    }
+    let responseMode = response.mode ?? mode
+    guard responseMode == mode else {
+        throw OTAError.responseVerificationFailed
+    }
+    let signatureData = response.signature.flatMap { Data(base64Encoded: $0) }
+    let verifiedResponse = AuthProof.verifyResponseMAC(
+        proofBase64: response.responseMAC,
+        psk: psk,
+        mode: responseMode,
+        nonceC: nonceC,
+        nonceS: nonceS,
+        approved: response.approved,
+        signature: signatureData,
+        error: response.error,
+        certFingerprint: certFP
+    )
+    guard verifiedResponse else {
+        throw OTAError.responseVerificationFailed
+    }
     if !response.approved {
         fputs("Server: \(response.error ?? "unknown error")\n", stderr)
         return false
-    }
-
-    guard let certFP = peerInfo.certFingerprint else {
-        throw OTAError.testProofVerificationFailed
-    }
-    let verified = AuthProof.verifyTestServerProof(
-        proofBase64: response.testProof,
-        psk: psk,
-        nonce: nonce,
-        certFingerprint: certFP
-    )
-    if !verified {
-        throw OTAError.testProofVerificationFailed
     }
     return true
 }

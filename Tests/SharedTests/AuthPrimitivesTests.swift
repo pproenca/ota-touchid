@@ -6,113 +6,127 @@ import Testing
 
 @Suite("Auth proof")
 struct AuthProofTests {
-    @Test("verify accepts valid base64 proof")
-    func verifyAcceptsValidProof() {
+    @Test("request MAC verifies for matching transcript")
+    func requestMACRoundTrip() {
         let key = SymmetricKey(size: .bits256)
-        let nonce = Data(repeating: 0x42, count: OTA.nonceSize)
-        let proof = AuthProof.compute(psk: key, nonce: nonce).base64EncodedString()
-
-        #expect(AuthProof.verify(proofBase64: proof, nonce: nonce, psk: key))
-    }
-
-    @Test("verify rejects nil, malformed, and mismatched proof")
-    func verifyRejectsInvalidProofs() {
-        let key = SymmetricKey(size: .bits256)
-        let otherKey = SymmetricKey(size: .bits256)
         let nonce = Data(repeating: 0x11, count: OTA.nonceSize)
-        let otherNonce = Data(repeating: 0x22, count: OTA.nonceSize)
-        let validProof = AuthProof.compute(psk: key, nonce: nonce).base64EncodedString()
-
-        #expect(AuthProof.verify(proofBase64: nil, nonce: nonce, psk: key) == false)
-        #expect(AuthProof.verify(proofBase64: "not-base64", nonce: nonce, psk: key) == false)
-        #expect(AuthProof.verify(proofBase64: validProof, nonce: otherNonce, psk: key) == false)
-        #expect(AuthProof.verify(proofBase64: validProof, nonce: nonce, psk: otherKey) == false)
-    }
-
-    @Test("compute returns 32-byte HMAC-SHA256")
-    func computeReturns32Bytes() {
-        let key = SymmetricKey(size: .bits256)
-        let nonce = Data(repeating: 0x42, count: OTA.nonceSize)
-        let result = AuthProof.compute(psk: key, nonce: nonce)
-        #expect(result.count == 32)  // SHA-256 output is always 32 bytes
-    }
-
-    @Test("compute is deterministic for same inputs")
-    func computeIsDeterministic() {
-        let key = SymmetricKey(size: .bits256)
-        let nonce = Data(repeating: 0x42, count: OTA.nonceSize)
-        let r1 = AuthProof.compute(psk: key, nonce: nonce)
-        let r2 = AuthProof.compute(psk: key, nonce: nonce)
-        #expect(r1 == r2)
-    }
-
-    @Test("compute differs for different keys")
-    func computeDiffersForDifferentKeys() {
-        let k1 = SymmetricKey(size: .bits256)
-        let k2 = SymmetricKey(size: .bits256)
-        let nonce = Data(repeating: 0x01, count: OTA.nonceSize)
-        #expect(AuthProof.compute(psk: k1, nonce: nonce) != AuthProof.compute(psk: k2, nonce: nonce))
-    }
-
-    @Test("compute differs for different nonces")
-    func computeDiffersForDifferentNonces() {
-        let key = SymmetricKey(size: .bits256)
-        let n1 = Data(repeating: 0x01, count: OTA.nonceSize)
-        let n2 = Data(repeating: 0x02, count: OTA.nonceSize)
-        #expect(AuthProof.compute(psk: key, nonce: n1) != AuthProof.compute(psk: key, nonce: n2))
-    }
-
-    @Test("verify rejects empty-string proof")
-    func verifyRejectsEmptyString() {
-        let key = SymmetricKey(size: .bits256)
-        let nonce = Data(repeating: 0x42, count: OTA.nonceSize)
-        #expect(AuthProof.verify(proofBase64: "", nonce: nonce, psk: key) == false)
-    }
-
-    @Test("test-mode server proof verifies with matching nonce and cert fingerprint")
-    func testModeServerProofRoundTrip() {
-        let key = SymmetricKey(size: .bits256)
-        let nonce = Data(repeating: 0xAB, count: OTA.nonceSize)
-        let certFP = Data(repeating: 0xCD, count: 32)
-        let proof = AuthProof.computeTestServerProof(
+        let proof = AuthProof.computeRequestMAC(
             psk: key,
+            mode: "auth",
             nonce: nonce,
-            certFingerprint: certFP
-        )
-        let proofBase64 = proof.base64EncodedString()
-        #expect(AuthProof.verifyTestServerProof(
-            proofBase64: proofBase64,
+            reason: "sudo",
+            hostname: "client.local",
+            hasStoredKey: true
+        ).base64EncodedString()
+
+        #expect(AuthProof.verifyRequestMAC(
+            proofBase64: proof,
             psk: key,
+            mode: "auth",
             nonce: nonce,
-            certFingerprint: certFP
+            reason: "sudo",
+            hostname: "client.local",
+            hasStoredKey: true
         ))
     }
 
-    @Test("test-mode server proof rejects mismatched nonce or cert fingerprint")
-    func testModeServerProofRejectsMismatch() {
+    @Test("request MAC rejects tampered reason/mode")
+    func requestMACRejectsTamper() {
         let key = SymmetricKey(size: .bits256)
-        let nonce = Data(repeating: 0x01, count: OTA.nonceSize)
-        let certFP = Data(repeating: 0x02, count: 32)
-        let badNonce = Data(repeating: 0x03, count: OTA.nonceSize)
-        let badCertFP = Data(repeating: 0x04, count: 32)
-        let proofBase64 = AuthProof.computeTestServerProof(
+        let nonce = Data(repeating: 0x22, count: OTA.nonceSize)
+        let proof = AuthProof.computeRequestMAC(
             psk: key,
+            mode: "auth",
             nonce: nonce,
+            reason: "sudo",
+            hostname: "client.local",
+            hasStoredKey: false
+        ).base64EncodedString()
+
+        #expect(AuthProof.verifyRequestMAC(
+            proofBase64: proof,
+            psk: key,
+            mode: "test",
+            nonce: nonce,
+            reason: "sudo",
+            hostname: "client.local",
+            hasStoredKey: false
+        ) == false)
+        #expect(AuthProof.verifyRequestMAC(
+            proofBase64: proof,
+            psk: key,
+            mode: "auth",
+            nonce: nonce,
+            reason: "other",
+            hostname: "client.local",
+            hasStoredKey: false
+        ) == false)
+    }
+
+    @Test("response MAC verifies and is channel-bound to cert fingerprint")
+    func responseMACRoundTrip() {
+        let key = SymmetricKey(size: .bits256)
+        let nonceC = Data(repeating: 0x33, count: OTA.nonceSize)
+        let nonceS = Data(repeating: 0x44, count: OTA.nonceSize)
+        let certFP = Data(repeating: 0x55, count: 32)
+        let signature = Data(repeating: 0xAA, count: 64)
+        let proof = AuthProof.computeResponseMAC(
+            psk: key,
+            mode: "auth",
+            nonceC: nonceC,
+            nonceS: nonceS,
+            approved: true,
+            signature: signature,
+            error: nil,
             certFingerprint: certFP
         ).base64EncodedString()
 
-        #expect(AuthProof.verifyTestServerProof(
-            proofBase64: proofBase64,
+        #expect(AuthProof.verifyResponseMAC(
+            proofBase64: proof,
             psk: key,
-            nonce: badNonce,
+            mode: "auth",
+            nonceC: nonceC,
+            nonceS: nonceS,
+            approved: true,
+            signature: signature,
+            error: nil,
             certFingerprint: certFP
-        ) == false)
-        #expect(AuthProof.verifyTestServerProof(
-            proofBase64: proofBase64,
+        ))
+
+        let otherCertFP = Data(repeating: 0x56, count: 32)
+        #expect(AuthProof.verifyResponseMAC(
+            proofBase64: proof,
             psk: key,
-            nonce: nonce,
-            certFingerprint: badCertFP
+            mode: "auth",
+            nonceC: nonceC,
+            nonceS: nonceS,
+            approved: true,
+            signature: signature,
+            error: nil,
+            certFingerprint: otherCertFP
         ) == false)
+    }
+
+    @Test("signature payload changes when reason changes")
+    func signaturePayloadIncludesReason() {
+        let nonceC = Data(repeating: 0x11, count: OTA.nonceSize)
+        let nonceS = Data(repeating: 0x22, count: OTA.nonceSize)
+        let certFP = Data(repeating: 0x33, count: 32)
+        let a = AuthProof.authSignaturePayload(
+            nonceC: nonceC,
+            nonceS: nonceS,
+            approved: true,
+            reason: "sudo",
+            certFingerprint: certFP
+        )
+        let b = AuthProof.authSignaturePayload(
+            nonceC: nonceC,
+            nonceS: nonceS,
+            approved: true,
+            reason: "login",
+            certFingerprint: certFP
+        )
+        #expect(a != b)
     }
 }
 

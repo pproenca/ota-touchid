@@ -6,7 +6,8 @@ public enum OTA {
     public static let serviceType = "_ota-touchid._tcp"
     public static let nonceSize = 32
     public static let maxFrameSize = 65_536
-    public static let protocolVersion = 1
+    public static let protocolVersion = 2
+    public static let defaultPort: UInt16 = 45_821
     public static let networkTimeoutSeconds: TimeInterval = 5
 
     public static var configDir: URL {
@@ -16,6 +17,10 @@ public enum OTA {
 
     public static var pskFile: URL {
         configDir.appendingPathComponent("psk")
+    }
+
+    public static var endpointFile: URL {
+        configDir.appendingPathComponent("server.endpoint.json")
     }
 }
 
@@ -30,6 +35,7 @@ public enum OTAError: Error, LocalizedError, Sendable {
     case timeout
     case frameTooLarge(Int)
     case signatureVerificationFailed
+    case responseVerificationFailed
     case testProofVerificationFailed
     case serverKeyNotTrusted
     case invalidPort(String)
@@ -53,6 +59,8 @@ public enum OTAError: Error, LocalizedError, Sendable {
             "Frame too large: \(n) bytes (max \(OTA.maxFrameSize))"
         case .signatureVerificationFailed:
             "Signature verification failed"
+        case .responseVerificationFailed:
+            "Response verification failed"
         case .testProofVerificationFailed:
             "Server test proof verification failed"
         case .serverKeyNotTrusted:
@@ -85,52 +93,127 @@ public enum OTAError: Error, LocalizedError, Sendable {
 
 public struct AuthRequest: Codable, Sendable {
     public let version: Int
-    public let nonce: String         // base64
+    public let mode: String?          // "auth" / "test"
+    public let nonce: String          // client nonce, base64
     public let reason: String
     public let hostname: String
     public let hasStoredKey: Bool     // tells server whether to include pubkey in response
-    public let clientProof: String?  // HMAC-SHA256(PSK, nonce), base64
-    public let mode: String?         // nil/"auth" = normal, "test" = PSK-only check
+    public let requestMAC: String?    // HMAC-SHA256 over request transcript, base64
+    public let clientProof: String?   // legacy v1 compatibility field
 
     public init(
+        mode: String = "auth",
         nonce: Data,
         reason: String,
         hasStoredKey: Bool = false,
-        clientProof: Data? = nil,
-        mode: String? = nil
+        requestMAC: Data? = nil
     ) {
         self.version = OTA.protocolVersion
+        self.mode = mode
         self.nonce = nonce.base64EncodedString()
         self.reason = reason
         self.hostname = ProcessInfo.processInfo.hostName
         self.hasStoredKey = hasStoredKey
-        self.clientProof = clientProof?.base64EncodedString()
-        self.mode = mode
+        self.requestMAC = requestMAC?.base64EncodedString()
+        self.clientProof = nil
     }
 }
 
 public struct AuthResponse: Codable, Sendable {
     public let version: Int
+    public let mode: String?        // echoes request mode for transcript clarity
     public let approved: Bool
+    public let nonceS: String?      // server nonce, base64
     public let signature: String?   // base64
     public let publicKey: String?   // base64 (only sent for TOFU when client lacks key)
-    public let testProof: String?   // base64 HMAC(PSK, context || nonce || tlsCertFingerprint)
+    public let responseMAC: String?  // HMAC-SHA256 over response transcript, base64
+    public let testProof: String?    // legacy v1 compatibility field
     public let error: String?
 
     public init(
+        mode: String = "auth",
         approved: Bool,
+        nonceS: Data? = nil,
         signature: Data? = nil,
         publicKey: Data? = nil,
-        testProof: Data? = nil,
+        responseMAC: Data? = nil,
         error: String? = nil
     ) {
         self.version = OTA.protocolVersion
+        self.mode = mode
         self.approved = approved
+        self.nonceS = nonceS?.base64EncodedString()
         self.signature = signature?.base64EncodedString()
         self.publicKey = publicKey?.base64EncodedString()
-        self.testProof = testProof?.base64EncodedString()
+        self.responseMAC = responseMAC?.base64EncodedString()
+        self.testProof = nil
         self.error = error
     }
+}
+
+public struct EndpointHint: Codable, Sendable {
+    public let host: String
+    public let port: UInt16
+
+    public init(host: String, port: UInt16 = OTA.defaultPort) {
+        self.host = host
+        self.port = port
+    }
+}
+
+public struct PairingBundle: Codable, Sendable {
+    public static let prefix = "otapair-v1."
+
+    public let version: Int
+    public let pskBase64: String
+    public let serverPublicKeyBase64: String
+    public let endpointHint: EndpointHint?
+
+    public init(
+        version: Int = 1,
+        pskBase64: String,
+        serverPublicKeyBase64: String,
+        endpointHint: EndpointHint?
+    ) {
+        self.version = version
+        self.pskBase64 = pskBase64
+        self.serverPublicKeyBase64 = serverPublicKeyBase64
+        self.endpointHint = endpointHint
+    }
+
+    public func encodeToken() throws -> String {
+        let data = try JSONEncoder().encode(self)
+        return Self.prefix + base64URLEncode(data)
+    }
+
+    public static func decodeToken(_ token: String) throws -> PairingBundle {
+        guard token.hasPrefix(prefix) else {
+            throw OTAError.badRequest("invalid pairing bundle prefix")
+        }
+        let payload = String(token.dropFirst(prefix.count))
+        guard let data = base64URLDecode(payload) else {
+            throw OTAError.badRequest("invalid pairing bundle encoding")
+        }
+        return try JSONDecoder().decode(PairingBundle.self, from: data)
+    }
+}
+
+private func base64URLEncode(_ data: Data) -> String {
+    data.base64EncodedString()
+        .replacingOccurrences(of: "+", with: "-")
+        .replacingOccurrences(of: "/", with: "_")
+        .replacingOccurrences(of: "=", with: "")
+}
+
+private func base64URLDecode(_ string: String) -> Data? {
+    var s = string
+        .replacingOccurrences(of: "-", with: "+")
+        .replacingOccurrences(of: "_", with: "/")
+    let remainder = s.count % 4
+    if remainder != 0 {
+        s.append(String(repeating: "=", count: 4 - remainder))
+    }
+    return Data(base64Encoded: s)
 }
 
 // MARK: - Length-prefixed framing (4-byte big-endian + JSON)

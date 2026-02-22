@@ -34,8 +34,8 @@ case "test":
         }
         i += 1
     }
-    if (host == nil) != (port == nil) {
-        fputs("Error: --host and --port must be used together\n", stderr)
+    if host == nil, port != nil {
+        fputs("Error: --port requires --host\n", stderr)
         exit(1)
     }
     ClientCommand.test(host: host, port: port)
@@ -67,8 +67,8 @@ case "auth":
         }
         i += 1
     }
-    if (host == nil) != (port == nil) {
-        fputs("Error: --host and --port must be used together\n", stderr)
+    if host == nil, port != nil {
+        fputs("Error: --port requires --host\n", stderr)
         exit(1)
     }
     ClientCommand.auth(reason: reason, host: host, port: port, allowTOFU: allowTOFU)
@@ -92,7 +92,7 @@ case "pair":
         exit(1)
     }
     do {
-        try ClientCommand.pair(pskBase64: pskInput)
+        try ClientCommand.pairInput(pskInput)
         exit(0)
     } catch {
         fputs("Error: \(error.localizedDescription)\n", stderr)
@@ -261,6 +261,15 @@ enum SetupCommand {
                 return
             }
 
+            let pairingToken = try PairingBundle(
+                pskBase64: config.pskBase64,
+                serverPublicKeyBase64: config.publicKeyBase64,
+                endpointHint: EndpointHint(
+                    host: ProcessInfo.processInfo.hostName,
+                    port: OTA.defaultPort
+                )
+            ).encodeToken()
+
             print("")
             print("OTA Touch ID Server Setup Complete")
             print(String(repeating: "\u{2500}", count: 40))
@@ -269,9 +278,8 @@ enum SetupCommand {
             print("To set up a client Mac (same Apple ID — auto-pairing):")
             print("  ota-touchid setup --client")
             print("")
-            print("To set up a client Mac (different Apple ID — manual PSK):")
-            print("  ota-touchid setup --client --psk \(config.pskBase64)")
-            print("  ota-touchid trust \(config.publicKeyBase64)")
+            print("To set up a client Mac (different Apple ID — one command):")
+            print("  ota-touchid pair \(pairingToken)")
             print("")
             print("Then verify with:")
             print("  ota-touchid test")
@@ -506,20 +514,21 @@ func printUsage() {
               Interactive install. Sets up server (Touch ID Mac) or client (remote Mac).
               Same-Apple-ID devices auto-pair via iCloud Keychain.
 
-          ota-touchid pair <psk-base64>
-              Store a PSK on this client for manual pairing.
+          ota-touchid pair <pairing-bundle|psk-base64>
+              Import secure pairing data (preferred) or raw PSK.
 
           ota-touchid pair --stdin
-              Read PSK from stdin (safer than command-line history).
+              Read pairing-bundle/PSK token from stdin (safer than command-line history).
 
           ota-touchid trust <server-public-key-base64>
               Pin the server public key on this client.
 
-          ota-touchid test [--host <ip> --port <port>]
+          ota-touchid test [--host <ip-or-hostname>] [--port <port>]
               Verify connectivity to server (no Touch ID prompt).
 
-          ota-touchid auth [--reason <text>] [--host <ip> --port <port>] [--allow-tofu]
+          ota-touchid auth [--reason <text>] [--host <ip-or-hostname>] [--port <port>] [--allow-tofu]
               Authenticate via Touch ID. Exit 0 = approved, 1 = denied.
+              If --host is used without --port, default port \(OTA.defaultPort) is used.
 
           ota-touchid status
               Show configuration and service status.

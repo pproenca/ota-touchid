@@ -206,7 +206,10 @@ private final class Server: @unchecked Sendable {
         self.publicKeyRaw = publicKeyRaw
         self.psk = psk
         self.certFingerprint = certFingerprint
-        self.listener = try NWListener(using: params)
+        guard let port = NWEndpoint.Port(rawValue: OTA.defaultPort) else {
+            throw OTAError.invalidPort("\(OTA.defaultPort)")
+        }
+        self.listener = try NWListener(using: params, on: port)
         listener.service = NWListener.Service(type: OTA.serviceType)
     }
 
@@ -350,20 +353,53 @@ private final class Server: @unchecked Sendable {
         case .test(let nonce, let hostname, _):
             log("[\(source)] test request (client hostname: \(hostname)) — OK")
             auditLog("TEST_OK source=\(source) hostname=\(hostname)")
-            let testProof = AuthProof.computeTestServerProof(
+            let nonceS: Data
+            do {
+                nonceS = try randomNonce()
+            } catch {
+                logErr("  nonce generation failed: \(error.localizedDescription)")
+                reply(.init(mode: "test", approved: false, error: "Internal server error"), on: conn)
+                return
+            }
+            let responseMAC = AuthProof.computeResponseMAC(
                 psk: psk,
-                nonce: nonce,
+                mode: "test",
+                nonceC: nonce,
+                nonceS: nonceS,
+                approved: true,
+                signature: nil,
+                error: nil,
                 certFingerprint: certFingerprint
             )
-            reply(.init(approved: true, testProof: testProof), on: conn)
+            reply(
+                .init(mode: "test", approved: true, nonceS: nonceS, responseMAC: responseMAC),
+                on: conn
+            )
 
-        case .auth(let nonce, let hostname, let hasStoredKey, _):
-            let displayReason = "OTA Touch ID request from \(source)"
+        case .auth(let nonce, let reason, let hostname, let hasStoredKey, _):
+            let trimmedReason = reason.trimmingCharacters(in: .whitespacesAndNewlines)
+            let displayReason = trimmedReason.isEmpty
+                ? "OTA Touch ID request from \(source)"
+                : "OTA Touch ID: \(String(trimmedReason.prefix(80)))"
             log("[\(source)] auth request (client hostname: \(hostname))")
+            let nonceS: Data
+            do {
+                nonceS = try randomNonce()
+            } catch {
+                logErr("  nonce generation failed: \(error.localizedDescription)")
+                reply(.init(mode: "auth", approved: false, error: "Internal server error"), on: conn)
+                return
+            }
 
             Task {
                 do {
-                    let signedData = nonce + self.certFingerprint
+                    let signedData = AuthProof.authSignaturePayload(
+                        nonceC: nonce,
+                        nonceS: nonceS,
+                        approved: true,
+                        reason: reason,
+                        certFingerprint: self.certFingerprint
+                    )
                     let sig = try await sign(
                         data: signedData,
                         keyBlob: keyBlob,
@@ -372,13 +408,50 @@ private final class Server: @unchecked Sendable {
                     log("  approved")
                     auditLog("APPROVED source=\(source) hostname=\(hostname)")
                     let pubKey: Data? = hasStoredKey ? nil : publicKeyRaw
+                    let responseMAC = AuthProof.computeResponseMAC(
+                        psk: self.psk,
+                        mode: "auth",
+                        nonceC: nonce,
+                        nonceS: nonceS,
+                        approved: true,
+                        signature: sig.rawRepresentation,
+                        error: nil,
+                        certFingerprint: self.certFingerprint
+                    )
                     self.reply(
-                        .init(approved: true, signature: sig.rawRepresentation, publicKey: pubKey),
+                        .init(
+                            mode: "auth",
+                            approved: true,
+                            nonceS: nonceS,
+                            signature: sig.rawRepresentation,
+                            publicKey: pubKey,
+                            responseMAC: responseMAC
+                        ),
                         on: conn)
                 } catch {
                     log("  denied (\(error.localizedDescription))")
                     auditLog("DENIED source=\(source) hostname=\(hostname) error=\(error.localizedDescription)")
-                    reply(.init(approved: false, error: "Authentication denied"), on: conn)
+                    let deniedError = "Authentication denied"
+                    let responseMAC = AuthProof.computeResponseMAC(
+                        psk: self.psk,
+                        mode: "auth",
+                        nonceC: nonce,
+                        nonceS: nonceS,
+                        approved: false,
+                        signature: nil,
+                        error: deniedError,
+                        certFingerprint: self.certFingerprint
+                    )
+                    reply(
+                        .init(
+                            mode: "auth",
+                            approved: false,
+                            nonceS: nonceS,
+                            responseMAC: responseMAC,
+                            error: deniedError
+                        ),
+                        on: conn
+                    )
                 }
             }
         }
@@ -393,4 +466,12 @@ private final class Server: @unchecked Sendable {
             conn.cancel()
         }
     }
+}
+
+private func randomNonce() throws -> Data {
+    var bytes = [UInt8](repeating: 0, count: OTA.nonceSize)
+    guard SecRandomCopyBytes(kSecRandomDefault, OTA.nonceSize, &bytes) == errSecSuccess else {
+        throw OTAError.keyGenerationFailed("SecRandomCopyBytes failed")
+    }
+    return Data(bytes)
 }
