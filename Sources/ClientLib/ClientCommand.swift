@@ -254,12 +254,6 @@ private func confirmTOFU(fingerprint: String) -> Bool {
     return line == "y" || line == "yes"
 }
 
-// [L5] 16-byte fingerprint matching SSH conventions (was 8 bytes).
-private func keyFingerprint(_ keyData: Data) -> String {
-    let hash = SHA256.hash(data: keyData)
-    return hash.prefix(16).map { String(format: "%02x", $0) }.joined(separator: ":")
-}
-
 // MARK: - Auth Flow
 
 private func requestAuth(endpoint: NWEndpoint, reason: String) async throws -> Bool {
