@@ -28,6 +28,46 @@ struct AuthProofTests {
         #expect(AuthProof.verify(proofBase64: validProof, nonce: otherNonce, psk: key) == false)
         #expect(AuthProof.verify(proofBase64: validProof, nonce: nonce, psk: otherKey) == false)
     }
+
+    @Test("compute returns 32-byte HMAC-SHA256")
+    func computeReturns32Bytes() {
+        let key = SymmetricKey(size: .bits256)
+        let nonce = Data(repeating: 0x42, count: OTA.nonceSize)
+        let result = AuthProof.compute(psk: key, nonce: nonce)
+        #expect(result.count == 32)  // SHA-256 output is always 32 bytes
+    }
+
+    @Test("compute is deterministic for same inputs")
+    func computeIsDeterministic() {
+        let key = SymmetricKey(size: .bits256)
+        let nonce = Data(repeating: 0x42, count: OTA.nonceSize)
+        let r1 = AuthProof.compute(psk: key, nonce: nonce)
+        let r2 = AuthProof.compute(psk: key, nonce: nonce)
+        #expect(r1 == r2)
+    }
+
+    @Test("compute differs for different keys")
+    func computeDiffersForDifferentKeys() {
+        let k1 = SymmetricKey(size: .bits256)
+        let k2 = SymmetricKey(size: .bits256)
+        let nonce = Data(repeating: 0x01, count: OTA.nonceSize)
+        #expect(AuthProof.compute(psk: k1, nonce: nonce) != AuthProof.compute(psk: k2, nonce: nonce))
+    }
+
+    @Test("compute differs for different nonces")
+    func computeDiffersForDifferentNonces() {
+        let key = SymmetricKey(size: .bits256)
+        let n1 = Data(repeating: 0x01, count: OTA.nonceSize)
+        let n2 = Data(repeating: 0x02, count: OTA.nonceSize)
+        #expect(AuthProof.compute(psk: key, nonce: n1) != AuthProof.compute(psk: key, nonce: n2))
+    }
+
+    @Test("verify rejects empty-string proof")
+    func verifyRejectsEmptyString() {
+        let key = SymmetricKey(size: .bits256)
+        let nonce = Data(repeating: 0x42, count: OTA.nonceSize)
+        #expect(AuthProof.verify(proofBase64: "", nonce: nonce, psk: key) == false)
+    }
 }
 
 @Suite("Source rate limiter")
@@ -47,5 +87,43 @@ struct SourceRateLimiterTests {
         // Move beyond the window and confirm the source can retry.
         now = now.addingTimeInterval(61)
         #expect(limiter.shouldAllow(source: "10.0.0.1"))
+    }
+
+    @Test("allows exactly maxAttempts, blocks on maxAttempts+1")
+    func exactBudgetBoundary() {
+        let limiter = SourceRateLimiter(maxAttempts: 3, windowSeconds: 60) { Date() }
+        #expect(limiter.shouldAllow(source: "a"))  // 1
+        #expect(limiter.shouldAllow(source: "a"))  // 2
+        #expect(limiter.shouldAllow(source: "a"))  // 3
+        #expect(limiter.shouldAllow(source: "a") == false)  // 4 = blocked
+    }
+
+    @Test("window reset allows a fresh budget")
+    func windowResetGivesFreshBudget() {
+        var now = Date(timeIntervalSince1970: 1_000_000)
+        let limiter = SourceRateLimiter(maxAttempts: 1, windowSeconds: 10) { now }
+
+        #expect(limiter.shouldAllow(source: "x"))       // 1 — allowed
+        #expect(limiter.shouldAllow(source: "x") == false)  // 2 — blocked
+
+        // Advance exactly to the window boundary
+        now = now.addingTimeInterval(10)
+        #expect(limiter.shouldAllow(source: "x"))       // reset, allowed again
+        #expect(limiter.shouldAllow(source: "x") == false)  // blocked again
+    }
+
+    @Test("sources are fully independent")
+    func sourcesAreIndependent() {
+        let limiter = SourceRateLimiter(maxAttempts: 1, windowSeconds: 60) { Date() }
+
+        #expect(limiter.shouldAllow(source: "a"))
+        #expect(limiter.shouldAllow(source: "a") == false)
+
+        // b is unaffected
+        #expect(limiter.shouldAllow(source: "b"))
+        #expect(limiter.shouldAllow(source: "b") == false)
+
+        // c is unaffected
+        #expect(limiter.shouldAllow(source: "c"))
     }
 }

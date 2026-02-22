@@ -141,6 +141,58 @@ struct FrameTests {
         #expect(decoded.mode == nil)
         #expect(decoded.reason == "sudo")
     }
+
+    @Test("readLength accepts exactly maxFrameSize")
+    func acceptExactlyMaxFrame() throws {
+        var header = Data(count: 4)
+        let max = UInt32(OTA.maxFrameSize).bigEndian
+        header.withUnsafeMutableBytes { $0.storeBytes(of: max, as: UInt32.self) }
+        let length = try Frame.readLength(from: header)
+        #expect(length == OTA.maxFrameSize)
+    }
+
+    @Test("readLength accepts minimum frame size of 1")
+    func acceptMinimumFrame() throws {
+        var header = Data(count: 4)
+        let one = UInt32(1).bigEndian
+        header.withUnsafeMutableBytes { $0.storeBytes(of: one, as: UInt32.self) }
+        let length = try Frame.readLength(from: header)
+        #expect(length == 1)
+    }
+
+    @Test("readLength rejects maxFrameSize + 1")
+    func rejectOneOverMax() {
+        var header = Data(count: 4)
+        let over = UInt32(OTA.maxFrameSize + 1).bigEndian
+        header.withUnsafeMutableBytes { $0.storeBytes(of: over, as: UInt32.self) }
+        #expect(throws: OTAError.self) {
+            try Frame.readLength(from: header)
+        }
+    }
+
+    @Test("encode/readLength round-trip for AuthRequest")
+    func encodeLengthRoundTrip() throws {
+        let nonce = Data(repeating: 0xFF, count: OTA.nonceSize)
+        let req = AuthRequest(nonce: nonce, reason: "test")
+        let encoded = try Frame.encode(req)
+        let length = try Frame.readLength(from: Data(encoded.prefix(4)))
+        #expect(length == encoded.count - 4)
+    }
+
+    @Test("decode rejects garbage JSON")
+    func decodeRejectsGarbage() {
+        let garbage = Data("this is not json".utf8)
+        #expect(throws: (any Error).self) {
+            try Frame.decode(AuthRequest.self, from: garbage)
+        }
+    }
+
+    @Test("decode rejects empty payload")
+    func decodeRejectsEmpty() {
+        #expect(throws: (any Error).self) {
+            try Frame.decode(AuthRequest.self, from: Data())
+        }
+    }
 }
 
 @Suite("OTA constants")
@@ -170,17 +222,54 @@ struct ConstantsTests {
 
 @Suite("Error descriptions")
 struct ErrorTests {
-    @Test("Client descriptions do not leak internals")
-    func clientDescriptions() {
-        let internalError = OTAError.secureEnclaveUnavailable
-        #expect(internalError.clientDescription == "Internal server error")
-        #expect(internalError.errorDescription != internalError.clientDescription)
+    @Test("every error has a non-empty errorDescription")
+    func allErrorDescriptions() {
+        let errors: [OTAError] = [
+            .secureEnclaveUnavailable,
+            .keyGenerationFailed("test"),
+            .badRequest("test"),
+            .serverNotFound,
+            .shortRead,
+            .timeout,
+            .frameTooLarge(999),
+            .signatureVerificationFailed,
+            .invalidPort("abc"),
+            .authenticationFailed,
+        ]
+        for error in errors {
+            #expect(error.errorDescription != nil, "Missing errorDescription for \(error)")
+            #expect(!error.errorDescription!.isEmpty, "Empty errorDescription for \(error)")
+        }
+    }
 
-        let keyError = OTAError.keyGenerationFailed("SecRandom failed")
-        #expect(keyError.clientDescription == "Internal server error")
+    @Test("client descriptions never leak internal details")
+    func clientDescriptionsDoNotLeak() {
+        // Internal errors → "Internal server error"
+        #expect(OTAError.secureEnclaveUnavailable.clientDescription == "Internal server error")
+        #expect(OTAError.keyGenerationFailed("SecRandom failed").clientDescription == "Internal server error")
 
-        let authError = OTAError.authenticationFailed
-        #expect(authError.clientDescription == "Authentication failed")
+        // Client errors → specific safe messages
+        #expect(OTAError.badRequest("invalid nonce").clientDescription == "Bad request")
+        #expect(OTAError.frameTooLarge(999_999).clientDescription == "Request too large")
+        #expect(OTAError.authenticationFailed.clientDescription == "Authentication failed")
+
+        // Everything else → "Request denied"
+        #expect(OTAError.serverNotFound.clientDescription == "Request denied")
+        #expect(OTAError.shortRead.clientDescription == "Request denied")
+        #expect(OTAError.timeout.clientDescription == "Request denied")
+        #expect(OTAError.signatureVerificationFailed.clientDescription == "Request denied")
+        #expect(OTAError.invalidPort("abc").clientDescription == "Request denied")
+    }
+
+    @Test("internal detail never appears in clientDescription")
+    func noInternalLeaks() {
+        let error = OTAError.keyGenerationFailed("SecRandomCopyBytes returned -25300")
+        #expect(!error.clientDescription.contains("SecRandom"))
+        #expect(!error.clientDescription.contains("-25300"))
+
+        let badReq = OTAError.badRequest("nonce too short: got 16 expected 32")
+        #expect(!badReq.clientDescription.contains("nonce"))
+        #expect(!badReq.clientDescription.contains("16"))
     }
 }
 
