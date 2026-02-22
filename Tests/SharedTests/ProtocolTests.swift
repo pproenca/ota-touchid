@@ -273,6 +273,62 @@ struct ErrorTests {
     }
 }
 
+@Suite("Message construction")
+struct MessageTests {
+    @Test("AuthRequest encodes nonce as base64 and sets version")
+    func authRequestInit() {
+        let nonce = Data([0x01, 0x02, 0x03])
+        let req = AuthRequest(nonce: nonce, reason: "sudo")
+        #expect(req.version == OTA.protocolVersion)
+        #expect(req.nonce == nonce.base64EncodedString())
+        #expect(req.reason == "sudo")
+        #expect(req.hostname == ProcessInfo.processInfo.hostName)
+        #expect(req.hasStoredKey == false)
+        #expect(req.clientProof == nil)
+        #expect(req.mode == nil)
+    }
+
+    @Test("AuthRequest with all optional fields")
+    func authRequestFull() {
+        let nonce = Data(repeating: 0xAA, count: 32)
+        let proof = Data(repeating: 0xBB, count: 32)
+        let req = AuthRequest(nonce: nonce, reason: "test", hasStoredKey: true, clientProof: proof, mode: "test")
+        #expect(req.hasStoredKey == true)
+        #expect(req.clientProof == proof.base64EncodedString())
+        #expect(req.mode == "test")
+    }
+
+    @Test("AuthResponse encodes signature and publicKey as base64")
+    func authResponseInit() {
+        let sig = Data(repeating: 0xCD, count: 64)
+        let pub = Data(repeating: 0xEF, count: 65)
+        let resp = AuthResponse(approved: true, signature: sig, publicKey: pub)
+        #expect(resp.version == OTA.protocolVersion)
+        #expect(resp.approved == true)
+        #expect(resp.signature == sig.base64EncodedString())
+        #expect(resp.publicKey == pub.base64EncodedString())
+        #expect(resp.error == nil)
+    }
+
+    @Test("AuthResponse denied with error, no signature")
+    func authResponseDenied() {
+        let resp = AuthResponse(approved: false, error: "denied by user")
+        #expect(resp.approved == false)
+        #expect(resp.signature == nil)
+        #expect(resp.publicKey == nil)
+        #expect(resp.error == "denied by user")
+    }
+
+    @Test("AuthResponse minimal approved, no optional fields")
+    func authResponseMinimal() {
+        let resp = AuthResponse(approved: true)
+        #expect(resp.approved == true)
+        #expect(resp.signature == nil)
+        #expect(resp.publicKey == nil)
+        #expect(resp.error == nil)
+    }
+}
+
 @Suite("PSK proof verification")
 struct PSKTests {
     @Test("HMAC-SHA256 proof is deterministic for same inputs")
